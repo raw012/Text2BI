@@ -52,6 +52,14 @@ class DatasetResponse(BaseModel):
     profile: DatasetProfile
 
 
+class DatabaseImportRequest(BaseModel):
+    database_url: str = Field(min_length=8, max_length=2000)
+    table_name: str = Field(min_length=1, max_length=255)
+    schema_name: str | None = Field(default=None, max_length=255)
+    dataset_name: str | None = Field(default=None, max_length=255)
+    row_limit: int = Field(default=100_000, ge=1, le=500_000)
+
+
 class FieldRef(BaseModel):
     table_id: str = "main"
     name: str

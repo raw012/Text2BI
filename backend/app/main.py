@@ -2,10 +2,13 @@ from pathlib import Path
 from threading import Thread
 from uuid import uuid4
 
+import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import MetaData, Table, create_engine as create_source_engine, inspect, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
 from .agent_tools.dashboard import prepare_dashboard_for_display, render_dashboard
@@ -17,6 +20,7 @@ from .schemas import (
     ChatRefinementRequest,
     ChatRefinementResponse,
     DashboardSchema,
+    DatabaseImportRequest,
     DatasetResponse,
     GenerateDashboardRequest,
     GenerateDashboardResponse,
@@ -29,6 +33,7 @@ from .services.data_service import (
     discover_file_tables,
     profile_dataset_tables,
     read_dataset_tables,
+    table_slug,
     write_dataset_manifest,
 )
 from .services.brand_service import infer_brand_identity, resolve_brand_assets
@@ -276,7 +281,16 @@ def health():
 
 @app.get("/datasets", response_model=list[DatasetResponse])
 def list_datasets(db: Session = Depends(get_db)):
-    return db.query(Dataset).order_by(Dataset.created_at.desc()).all()
+    records = db.query(Dataset).order_by(Dataset.created_at.desc()).all()
+    seen: set[str] = set()
+    unique: list[Dataset] = []
+    for record in records:
+        key = record.name.strip().casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 @app.get("/datasets/{dataset_id}", response_model=DatasetResponse)
@@ -331,6 +345,27 @@ def _archive_dataset_version(db: Session, dataset: Dataset, operation: str) -> N
     )
 
 
+def _missing_dashboard_fields(
+    db: Session,
+    dataset: Dataset,
+    tables: dict[str, pd.DataFrame],
+) -> list[str]:
+    required: dict[str, set[str]] = {}
+    dashboards = db.query(Dashboard).filter(Dashboard.dataset_id == dataset.id).all()
+    for dashboard in dashboards:
+        schema = DashboardSchema.model_validate(dashboard.schema)
+        for filter_spec in schema.filters:
+            required.setdefault(filter_spec.table_id, set()).add(filter_spec.field)
+        for component in schema.components:
+            required.setdefault(component.query.table_id, set()).add(component.query.metric)
+            if component.query.group_by:
+                required[component.query.table_id].add(component.query.group_by)
+    return [
+        f"{table_id}.{field}"
+        for table_id, fields in required.items()
+        for field in fields
+        if table_id not in tables or field not in tables[table_id].columns
+    ]
 @app.get("/datasets/{dataset_id}/versions")
 def dataset_versions(dataset_id: int, db: Session = Depends(get_db)):
     if not db.get(Dataset, dataset_id):
@@ -395,14 +430,130 @@ async def upload_dataset(
         raise HTTPException(400, f"Could not read dataset: {exc}") from exc
 
     names = [file.filename or "dataset" for file in files]
+    display_name = names[0] if len(names) == 1 else f"{names[0]} + {len(names) - 1} more"
+    existing = next(
+        (
+            record
+            for record in db.query(Dataset).order_by(Dataset.created_at.desc()).all()
+            if record.name.strip().casefold() == display_name.strip().casefold()
+        ),
+        None,
+    )
+    if existing:
+        old_table_ids = [table["id"] for table in existing.profile.get("tables", [])]
+        if len(old_table_ids) == len(entries):
+            for entry, old_id in zip(entries, old_table_ids, strict=True):
+                entry["id"] = old_id
+            manifest = write_dataset_manifest(entries, manifest)
+            tables = read_dataset_tables(manifest)
+            profile = profile_dataset_tables(tables, entries)
+        missing = _missing_dashboard_fields(db, existing, tables)
+        if missing:
+            raise HTTPException(
+                409,
+                "Same-name upload would break existing dashboards. Missing fields: "
+                + ", ".join(missing[:12]),
+            )
+        _archive_dataset_version(db, existing, "same-name upload")
+        existing.file_path = str(manifest)
+        existing.row_count = profile.rows
+        existing.column_count = profile.columns
+        existing.profile = profile.model_dump()
+        db.commit()
+        db.refresh(existing)
+        return existing
+
     dataset = Dataset(
-        name=names[0] if len(names) == 1 else f"{names[0]} + {len(names) - 1} more",
+        name=display_name,
         file_path=str(manifest),
         row_count=profile.rows,
         column_count=profile.columns,
         profile=profile.model_dump(),
     )
     db.add(dataset)
+    db.commit()
+    db.refresh(dataset)
+    return dataset
+
+
+@app.post("/connect_database", response_model=DatasetResponse)
+def connect_database(payload: DatabaseImportRequest, db: Session = Depends(get_db)):
+    """Import a governed snapshot from one database table without storing credentials."""
+    try:
+        parsed = make_url(payload.database_url)
+        if parsed.get_backend_name() not in {"postgresql", "mysql", "mariadb", "sqlite"}:
+            raise ValueError("Supported databases are PostgreSQL, MySQL/MariaDB, and SQLite.")
+        source = create_source_engine(payload.database_url, pool_pre_ping=True)
+        inspector = inspect(source)
+        available = inspector.get_table_names(schema=payload.schema_name)
+        if payload.table_name not in available:
+            raise ValueError(
+                f"Table '{payload.table_name}' was not found. Available: {', '.join(available[:20])}"
+            )
+        metadata = MetaData()
+        source_table = Table(
+            payload.table_name,
+            metadata,
+            schema=payload.schema_name,
+            autoload_with=source,
+        )
+        with source.connect() as connection:
+            result = connection.execute(select(source_table).limit(payload.row_limit))
+            frame = pd.DataFrame(result.fetchall(), columns=result.keys())
+        source.dispose()
+        if frame.empty:
+            raise ValueError("The selected table is empty.")
+
+        snapshot_path = settings.upload_dir / f"database-{uuid4().hex}.csv"
+        frame.to_csv(snapshot_path, index=False)
+        table_id = table_slug(payload.table_name)
+        entry = {
+            "id": table_id,
+            "name": payload.table_name,
+            "source_file": f"database:{payload.table_name}",
+            "path": str(snapshot_path),
+            "sheet_name": None,
+        }
+        manifest = write_dataset_manifest(
+            [entry],
+            settings.upload_dir / f"dataset-{uuid4().hex}.json",
+        )
+        profile = profile_dataset_tables({table_id: frame}, [entry])
+    except Exception as exc:
+        raise HTTPException(400, f"Could not import database table: {exc}") from exc
+
+    display_name = payload.dataset_name or f"{parsed.database or 'database'} · {payload.table_name}"
+    existing = next(
+        (
+            record
+            for record in db.query(Dataset).order_by(Dataset.created_at.desc()).all()
+            if record.name.strip().casefold() == display_name.strip().casefold()
+        ),
+        None,
+    )
+    if existing:
+        missing = _missing_dashboard_fields(db, existing, {table_id: frame})
+        if missing:
+            raise HTTPException(
+                409,
+                "Database refresh would break existing dashboards. Missing fields: "
+                + ", ".join(missing[:12]),
+            )
+        _archive_dataset_version(db, existing, "database refresh")
+        existing.file_path = str(manifest)
+        existing.row_count = profile.rows
+        existing.column_count = profile.columns
+        existing.profile = profile.model_dump()
+        dataset = existing
+    else:
+        dataset = Dataset(
+            name=display_name,
+            file_path=str(manifest),
+            row_count=profile.rows,
+            column_count=profile.columns,
+            profile=profile.model_dump(),
+        )
+        db.add(dataset)
     db.commit()
     db.refresh(dataset)
     return dataset
@@ -577,6 +728,14 @@ def get_dashboard(dashboard_id: int, db: Session = Depends(get_db)):
 @app.get("/dashboards")
 def list_dashboards(db: Session = Depends(get_db)):
     records = db.query(Dashboard).order_by(Dashboard.updated_at.desc()).all()
+    seen: set[tuple[int, str]] = set()
+    unique: list[Dashboard] = []
+    for record in records:
+        key = (record.dataset_id, record.title.strip().casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
     return {
         "dashboards": [
             {
@@ -590,7 +749,7 @@ def list_dashboards(db: Session = Depends(get_db)):
                 "quality_score": record.schema.get("quality_score", 0),
                 "updated_at": record.updated_at,
             }
-            for record in records
+            for record in unique
         ]
     }
 
