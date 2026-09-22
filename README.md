@@ -29,6 +29,17 @@ canvas. It opens as a right-side conversational control surface, shows the
 current report and revision, offers targeted change prompts, and creates a new
 evaluated revision instead of behaving like another report card.
 
+The workspace navigation remains visible while creating, viewing, or editing a
+dashboard. The breadcrumb returns to the dashboard library without losing the
+saved report. A new dashboard can start from an existing Text2BI data source, a
+new CSV/Excel upload, or a PostgreSQL, MySQL/MariaDB, or SQLite table snapshot.
+
+Data-source names are unique in the normal workspace view. Uploading the same
+filename again updates the existing logical source and archives the previous
+snapshot as a version. Likewise, the dashboard library shows only the latest
+dashboard for each `(data source, title)` pair; historical database records are
+preserved rather than deleted.
+
 ## Architecture
 
 ```mermaid
@@ -256,6 +267,7 @@ generated mark is an official logo.
 | `POST` | `/datasets/{id}/replace` | Validate and activate a new source version |
 | `GET` | `/datasets/{id}/versions` | List archived dataset versions |
 | `POST` | `/upload_dataset` | Profile multiple CSV/XLS/XLSX files and sheets |
+| `POST` | `/connect_database` | Import a PostgreSQL, MySQL/MariaDB, or SQLite table snapshot without storing credentials |
 | `POST` | `/upload_logo` | Store an optional dashboard logo |
 | `POST` | `/generate_dashboard` | Run the iterative multi-agent workflow |
 | `POST` | `/workflow_runs/generate` | Start generation without blocking the browser |
@@ -276,11 +288,12 @@ for the current native-development configuration.
 
 ## Current connector roadmap
 
-CSV and Excel are implemented. The Data Sources workspace and versioned dataset
-contract are the base for scheduled Google Sheets, PostgreSQL, MySQL, Snowflake,
-and Databricks connectors. Production connector work still requires encrypted
-credential storage, tenant-level permissions, refresh jobs, lineage, and schema
-drift mapping.
+CSV, Excel, and one-time PostgreSQL, MySQL/MariaDB, and SQLite table snapshots
+are implemented. Database credentials are used only for the import request and
+are not persisted. The Data Sources workspace and versioned dataset contract
+are the base for scheduled Google Sheets, Snowflake, and Databricks connectors.
+Production connector work still requires encrypted credential storage,
+tenant-level permissions, refresh jobs, lineage, and schema drift mapping.
 
 ## Validation
 
