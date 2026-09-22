@@ -42,12 +42,17 @@ function AnalysisStudio() {
   const fileInput = useRef<HTMLInputElement>(null);
   const logoInput = useRef<HTMLInputElement>(null);
   const [dataset, setDataset] = useState<Dataset | null>(null);
+  const [availableDatasets, setAvailableDatasets] = useState<Dataset[]>([]);
+  const [dataMode, setDataMode] = useState<"existing" | "upload" | "database">("existing");
+  const [databaseUrl, setDatabaseUrl] = useState("");
+  const [databaseTable, setDatabaseTable] = useState("");
+  const [databaseName, setDatabaseName] = useState("");
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [dashboardId, setDashboardId] = useState<number | null>(null);
   const [request, setRequest] = useState("");
   const [logoUrl, setLogoUrl] = useState("");
   const [logoName, setLogoName] = useState("");
-  const [loading, setLoading] = useState<"upload" | "generate" | "modify" | null>(null);
+  const [loading, setLoading] = useState<"upload" | "connect" | "generate" | "modify" | null>(null);
   const [workflowRun, setWorkflowRun] = useState<WorkflowRun | null>(null);
   const [instruction, setInstruction] = useState("");
   const [copilotOpen, setCopilotOpen] = useState(false);
@@ -57,6 +62,7 @@ function AnalysisStudio() {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    api.datasets().then(setAvailableDatasets).catch(() => setAvailableDatasets([]));
     const id = Number(new URLSearchParams(window.location.search).get("dashboard"));
     if (!Number.isInteger(id) || id < 1) return;
     api.dashboard(id)
@@ -100,6 +106,7 @@ function AnalysisStudio() {
     try {
       const uploaded = await api.upload(files);
       setDataset(uploaded);
+      setAvailableDatasets(await api.datasets());
       setDashboard(null);
       setDashboardId(null);
       setWorkflowRun(null);
@@ -112,6 +119,25 @@ function AnalysisStudio() {
 
   async function onFiles(event: ChangeEvent<HTMLInputElement>) {
     await upload(Array.from(event.target.files || []));
+  }
+
+  async function importDatabase() {
+    if (!databaseUrl.trim() || !databaseTable.trim()) return;
+    setLoading("connect");
+    setError("");
+    try {
+      const imported = await api.connectDatabase({
+        database_url: databaseUrl.trim(),
+        table_name: databaseTable.trim(),
+        dataset_name: databaseName.trim() || undefined,
+      });
+      setDataset(imported);
+      setAvailableDatasets(await api.datasets());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Database import failed.");
+    } finally {
+      setLoading(null);
+    }
   }
 
   async function onLogo(event: ChangeEvent<HTMLInputElement>) {
@@ -207,38 +233,35 @@ function AnalysisStudio() {
                 <span>01</span>
                 <div>
                   <h2>Connect data</h2>
-                  <p>Multiple CSV and Excel files are supported.</p>
+                  <p>Reuse a source, upload files, or import a database table.</p>
                 </div>
               </div>
-              <button
-                className={`upload-zone ${dataset ? "has-file" : ""}`}
-                onClick={() => fileInput.current?.click()}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  void upload(Array.from(event.dataTransfer.files));
-                }}
-                disabled={loading !== null}
-              >
-                {loading === "upload" ? (
-                  <LoaderCircle className="spin" size={28} />
-                ) : dataset ? (
-                  <>
-                    <FileSpreadsheet size={28} />
-                    <strong>{dataset.name}</strong>
-                    <small>
-                      {dataset.profile.tables.length} tables ·{" "}
-                      {dataset.row_count.toLocaleString()} rows · {dataset.column_count} fields
-                    </small>
-                  </>
-                ) : (
-                  <>
-                    <UploadCloud size={30} />
-                    <strong>Drop files here or browse</strong>
-                    <small>CSV, XLS, XLSX · up to 25 MB per file</small>
-                  </>
-                )}
-              </button>
+              <div className="data-mode-tabs">
+                <button className={dataMode === "existing" ? "active" : ""} onClick={() => setDataMode("existing")}><Database size={14} /> Existing</button>
+                <button className={dataMode === "upload" ? "active" : ""} onClick={() => setDataMode("upload")}><UploadCloud size={14} /> Upload</button>
+                <button className={dataMode === "database" ? "active" : ""} onClick={() => setDataMode("database")}><Table2 size={14} /> Database</button>
+              </div>
+              {dataMode === "existing" && (
+                <div className="existing-source-picker">
+                  {availableDatasets.map((item) => <button key={item.id} className={dataset?.id === item.id ? "selected" : ""} onClick={() => setDataset(item)}><span><FileSpreadsheet size={16} /></span><div><strong>{item.name}</strong><small>{item.row_count.toLocaleString()} rows · {item.column_count} fields</small></div>{dataset?.id === item.id && <Check size={15} />}</button>)}
+                  {!availableDatasets.length && <div className="source-picker-empty">No saved sources yet. Upload a file or connect a database.</div>}
+                </div>
+              )}
+              {dataMode === "upload" && <button
+                  className={`upload-zone ${dataset ? "has-file" : ""}`}
+                  onClick={() => fileInput.current?.click()}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => { event.preventDefault(); void upload(Array.from(event.dataTransfer.files)); }}
+                  disabled={loading !== null}
+                >
+                  {loading === "upload" ? <LoaderCircle className="spin" size={28} /> : dataset ? <><FileSpreadsheet size={28} /><strong>{dataset.name}</strong><small>{dataset.profile.tables.length} tables · {dataset.row_count.toLocaleString()} rows · {dataset.column_count} fields</small></> : <><UploadCloud size={30} /><strong>Drop files here or browse</strong><small>Same-name uploads become a new source version</small></>}
+                </button>}
+              {dataMode === "database" && <div className="database-connect-form">
+                <label><span>Connection URL</span><input type="password" value={databaseUrl} onChange={(event) => setDatabaseUrl(event.target.value)} placeholder="postgresql+psycopg://user:password@host/database" /></label>
+                <div><label><span>Table</span><input value={databaseTable} onChange={(event) => setDatabaseTable(event.target.value)} placeholder="employees" /></label><label><span>Display name</span><input value={databaseName} onChange={(event) => setDatabaseName(event.target.value)} placeholder="HR warehouse" /></label></div>
+                <button onClick={() => void importDatabase()} disabled={!databaseUrl.trim() || !databaseTable.trim() || loading !== null}>{loading === "connect" ? <LoaderCircle className="spin" size={15} /> : <Database size={15} />} Import table snapshot</button>
+                <small>Credentials are used for this import and are not stored by Text2BI.</small>
+              </div>}
               <input
                 ref={fileInput}
                 type="file"
@@ -559,6 +582,7 @@ function App() {
   const [dashboards, setDashboards] = useState<DashboardSummary[]>([]);
   const [workspaceError, setWorkspaceError] = useState("");
   const [loadingLibrary, setLoadingLibrary] = useState(true);
+  const [studioKey, setStudioKey] = useState(0);
 
   async function refreshLibrary() {
     setLoadingLibrary(true);
@@ -580,27 +604,20 @@ function App() {
 
   function openDashboard(id: number) {
     window.history.replaceState({}, "", `?dashboard=${id}`);
+    setStudioKey((current) => current + 1);
     setView("studio");
   }
 
   function openStudio() {
     window.history.replaceState({}, "", window.location.pathname);
+    setStudioKey((current) => current + 1);
     setView("studio");
   }
 
-  if (view === "studio") {
-    return (
-      <div className="studio-wrapper">
-        <button className="workspace-return" onClick={() => {
-          window.history.replaceState({}, "", window.location.pathname);
-          setView("home");
-          void refreshLibrary();
-        }}>
-          <ArrowRight size={14} /> Back to workspace
-        </button>
-        <AnalysisStudio />
-      </div>
-    );
+  function navigate(next: WorkspaceView) {
+    if (next !== "studio") window.history.replaceState({}, "", window.location.pathname);
+    setView(next);
+    if (next === "home" || next === "dashboards" || next === "data") void refreshLibrary();
   }
 
   return (
@@ -608,22 +625,23 @@ function App() {
       <aside className="workspace-sidebar">
         <div className="workspace-brand"><span><Sparkles size={17} /></span><div><strong>Text2BI</strong><small>AI analytics studio</small></div></div>
         <nav aria-label="Workspace navigation">
-          <WorkspaceNav icon={<House size={17} />} label="Home" active={view === "home"} onClick={() => setView("home")} />
-          <WorkspaceNav icon={<LayoutDashboard size={17} />} label="Dashboards" count={dashboards.length} active={view === "dashboards"} onClick={() => setView("dashboards")} />
-          <WorkspaceNav icon={<Database size={17} />} label="Data sources" count={datasets.length} active={view === "data"} onClick={() => setView("data")} />
-          <WorkspaceNav icon={<Bot size={17} />} label="Ask your data" active={view === "assistant"} onClick={() => setView("assistant")} />
+          <WorkspaceNav icon={<House size={17} />} label="Home" active={view === "home"} onClick={() => navigate("home")} />
+          <WorkspaceNav icon={<LayoutDashboard size={17} />} label="Dashboards" count={dashboards.length} active={view === "dashboards" || view === "studio"} onClick={() => navigate("dashboards")} />
+          <WorkspaceNav icon={<Database size={17} />} label="Data sources" count={datasets.length} active={view === "data"} onClick={() => navigate("data")} />
+          <WorkspaceNav icon={<Bot size={17} />} label="Ask your data" active={view === "assistant"} onClick={() => navigate("assistant")} />
         </nav>
         <div className="sidebar-foot"><span>Local workspace</span><small>Connected to Text2BI API</small></div>
       </aside>
       <main className="workspace-main">
         <header className="workspace-topbar">
-          <div className="workspace-search"><Search size={15} /><span>Search dashboards and data</span></div>
+          {view === "studio" ? <button className="workspace-breadcrumb" onClick={() => navigate("dashboards")}><ArrowRight size={14} /> Dashboards <ChevronRight size={13} /><strong>{new URLSearchParams(window.location.search).has("dashboard") ? "Report editor" : "New dashboard"}</strong></button> : <div className="workspace-search"><Search size={15} /><span>Search dashboards and data</span></div>}
           <button className="new-dashboard" onClick={openStudio}><Plus size={16} /> New dashboard</button>
         </header>
         {view === "home" && <WorkspaceHome datasets={datasets} dashboards={dashboards} loading={loadingLibrary} onOpenDashboard={openDashboard} onView={setView} onCreate={openStudio} />}
         {view === "dashboards" && <DashboardLibrary dashboards={dashboards} onOpen={openDashboard} onCreate={openStudio} />}
         {view === "data" && <DataLibrary datasets={datasets} onRefresh={refreshLibrary} onCreate={openStudio} />}
         {view === "assistant" && <DataAssistant datasets={datasets} onCreate={openStudio} />}
+        {view === "studio" && <AnalysisStudio key={studioKey} />}
       </main>
       <ErrorToast error={workspaceError} onClose={() => setWorkspaceError("")} />
     </div>

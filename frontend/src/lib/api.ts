@@ -31,6 +31,13 @@ export const api = {
     files.forEach((file) => body.append("files", file));
     return request<Dataset>(`/datasets/${datasetId}/replace`, { method: "POST", body });
   },
+  connectDatabase(payload: { database_url: string; table_name: string; schema_name?: string; dataset_name?: string }) {
+    return request<Dataset>("/connect_database", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  },
   upload(files: File[]) {
     const body = new FormData();
     files.forEach((file) => body.append("files", file));
