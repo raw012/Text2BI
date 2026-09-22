@@ -1,250 +1,607 @@
-import json
-from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
+from ..agent_tools.analysis import analyze_dataset, validate_data_analysis
+from ..agent_tools.business import build_business_fallback, validate_business_analysis
+from ..agent_tools.dashboard import (
+    apply_evaluation_refinement,
+    apply_user_instruction,
+    build_dashboard_fallback,
+    evaluate_dashboard,
+    normalize_layout,
+    render_dashboard,
+)
+from ..agent_tools.kpi import calculate_kpis
 from ..config import settings
 from ..schemas import (
-    ComponentSchema,
+    BusinessAnalysisSpec,
     DashboardSchema,
-    DatasetProfile,
-    FilterSchema,
-    LayoutSchema,
-    QuerySchema,
+    DataAnalysisSpec,
+    EvaluationResult,
+    KPIResultSet,
+    RenderArtifact,
+    VisualReview,
 )
+from ..services.data_service import read_dataset_tables
+from ..services.llm_service import qwen_structured, qwen_vision_structured
+from ..services.visual_service import capture_dashboard_html
+from ..services.workflow_progress import update_workflow_run
 
 
 class WorkflowState(TypedDict, total=False):
+    run_id: str
     dataset_id: int
+    dataset_file_path: str
     profile: dict[str, Any]
     business_request: str
+    logo_url: str | None
+    logo_source: str | None
+    brand_identity: dict[str, Any] | None
+    user_preferences: str | None
+    user_feedback: str | None
+    current_dashboard: dict[str, Any] | None
     data_analysis: dict[str, Any]
     business_analysis: dict[str, Any]
+    kpi_results: dict[str, Any]
     dashboard: dict[str, Any]
-    critique: dict[str, Any]
+    render_artifact: dict[str, Any]
+    evaluation: dict[str, Any]
     iteration: int
+    route_hint: str
 
 
-def _llm_json(system: str, payload: dict[str, Any]) -> dict[str, Any] | None:
-    if not settings.openai_api_key:
-        return None
-    try:
-        from langchain_openai import ChatOpenAI
-
-        model = ChatOpenAI(model=settings.openai_model, temperature=0.1, api_key=settings.openai_api_key)
-        response = model.invoke(
-            [
-                ("system", system + " Return valid JSON only."),
-                ("human", json.dumps(payload, default=str)),
-            ]
+def request_router(state: WorkflowState) -> dict[str, Any]:
+    update_workflow_run(
+        state.get("run_id"),
+        status="running",
+        node="request_router",
+        stage="Understanding your request",
+        message="Routing the request to the right analyst.",
+        progress=4,
+    )
+    if not state.get("current_dashboard"):
+        return {"route_hint": "data"}
+    feedback = (state.get("user_feedback") or "").lower()
+    if any(
+        token in feedback
+        for token in (
+            "数据",
+            "字段",
+            "计算",
+            "公式",
+            "聚合",
+            "平均",
+            "总和",
+            "data",
+            "field",
+            "formula",
+            "aggregation",
         )
-        text = str(response.content).strip().removeprefix("```json").removesuffix("```").strip()
-        return json.loads(text)
-    except Exception:
-        # Keep the MVP usable during rate limits, provider outages, or malformed output.
-        return None
+    ):
+        route = "data"
+    elif any(
+        token in feedback
+        for token in (
+            "业务",
+            "目标",
+            "kpi",
+            "受众",
+            "高管",
+            "business",
+            "objective",
+            "audience",
+        )
+    ):
+        route = "business"
+    else:
+        route = "design"
+    return {
+        "route_hint": route,
+        "dashboard": state["current_dashboard"],
+        "iteration": 0,
+    }
+
+
+def route_request(state: WorkflowState) -> str:
+    return state["route_hint"]
 
 
 def data_analyst(state: WorkflowState) -> dict[str, Any]:
-    profile = DatasetProfile.model_validate(state["profile"])
-    fallback = {
-        "metrics": profile.metrics[:6],
-        "dimensions": profile.dimensions[:8],
-        "dates": profile.dates[:3],
-        "candidate_kpis": [
-            {"field": metric, "aggregation": "avg" if any(k in metric.lower() for k in ("age", "rate", "score")) else "sum"}
-            for metric in profile.metrics[:4]
-        ],
-        "summary": f"{profile.rows:,} records across {profile.columns} fields.",
-    }
-    enriched = _llm_json(
-        "You are a data analyst. Identify reliable metrics, dimensions, dates, and candidate KPIs from a dataset profile.",
-        {"profile": state["profile"]},
+    iteration = state.get("iteration", 0)
+    update_workflow_run(
+        state.get("run_id"),
+        node="data_analyst",
+        stage="Data Analyst",
+        message="Profiling tables, fields, missing values, duplicates, and usable metrics.",
+        progress=min(90, 5 + iteration * 18),
+        iteration=iteration,
     )
-    return {"data_analysis": enriched or fallback}
+    tables = read_dataset_tables(state["dataset_file_path"])
+    deterministic = analyze_dataset(tables, state["profile"])
+    enriched = qwen_structured(
+        "data_analysis",
+        "Review and enrich the deterministic dataset analysis. Preserve every calculated fact.",
+        {
+            "profile": state["profile"],
+            "deterministic_analysis": deterministic.model_dump(mode="json"),
+            "user_request": state["business_request"],
+            "evaluation_feedback": state.get("evaluation"),
+            "user_feedback": state.get("user_feedback"),
+        },
+        DataAnalysisSpec,
+    )
+    spec = validate_data_analysis(enriched or deterministic, state["profile"])
+    return {"data_analysis": spec.model_dump(mode="json")}
 
 
 def business_analyst(state: WorkflowState) -> dict[str, Any]:
-    data = state["data_analysis"]
-    request = state["business_request"]
-    fallback = {
-        "objective": request,
-        "recommended_kpis": data.get("candidate_kpis", [])[:4],
-        "questions": [
-            "Where is performance concentrated?",
-            "Which segment needs attention?",
-            "How is the key metric trending?",
-        ],
-        "audience": "Business leadership",
-    }
-    enriched = _llm_json(
-        "You are a business analyst. Translate the request into measurable KPIs and decision questions. Use only supplied fields.",
-        {"request": request, "data_analysis": data},
+    iteration = state.get("iteration", 0)
+    update_workflow_run(
+        state.get("run_id"),
+        node="business_analyst",
+        stage="Business Analyst",
+        message="Defining the decision goal and the core KPIs supported by your data.",
+        progress=min(92, 8 + iteration * 18),
+        iteration=iteration,
     )
-    return {"business_analysis": enriched or fallback}
+    data = DataAnalysisSpec.model_validate(state["data_analysis"])
+    fallback = build_business_fallback(state["business_request"], data)
+    planned = qwen_structured(
+        "business_analysis",
+        "Translate the request into supported KPI definitions and business questions.",
+        {
+            "request": state["business_request"],
+            "user_feedback": state.get("user_feedback"),
+            "data_analysis": data.model_dump(mode="json"),
+            "evaluation_feedback": state.get("evaluation"),
+        },
+        BusinessAnalysisSpec,
+    )
+    spec = validate_business_analysis(
+        planned or fallback,
+        data,
+        request=state["business_request"],
+    )
+    return {"business_analysis": spec.model_dump(mode="json")}
 
 
-def _pick_metric(profile: DatasetProfile) -> str:
-    return profile.metrics[0] if profile.metrics else profile.column_profiles[0].name
+def kpi_calculator(state: WorkflowState) -> dict[str, Any]:
+    iteration = state.get("iteration", 0)
+    update_workflow_run(
+        state.get("run_id"),
+        node="kpi_calculator",
+        stage="KPI calculation",
+        message="Calculating validated KPI values with Python.",
+        progress=min(94, 11 + iteration * 18),
+        iteration=iteration,
+    )
+    data = DataAnalysisSpec.model_validate(state["data_analysis"])
+    business = BusinessAnalysisSpec.model_validate(state["business_analysis"])
+    tables = read_dataset_tables(state["dataset_file_path"])
+    results = calculate_kpis(business.kpis, tables, data)
+    return {"kpi_results": results.model_dump(mode="json")}
+
+
+def _candidate_is_data_safe(
+    candidate: DashboardSchema,
+    data: DataAnalysisSpec,
+    business: BusinessAnalysisSpec,
+) -> bool:
+    fields = {(column.table_id, column.name) for column in data.semantic_columns}
+    metric_ids = {kpi.id for kpi in business.kpis}
+    required_kpis = {kpi.id for kpi in business.kpis[: min(4, len(business.kpis))]}
+    represented_kpis = {
+        component.metric_id
+        for component in candidate.components
+        if component.type == "kpi" and component.metric_id
+    }
+    return (
+        candidate.dataset_id > 0
+        and required_kpis.issubset(represented_kpis)
+        and all(
+            (component.query.table_id, component.query.metric) in fields
+            and (
+                not component.query.group_by
+                or (component.query.table_id, component.query.group_by) in fields
+            )
+            and (not component.metric_id or component.metric_id in metric_ids)
+            for component in candidate.components
+        )
+        and all(
+            (filter_item.table_id, filter_item.field) in fields
+            for filter_item in candidate.filters
+        )
+    )
 
 
 def bi_designer(state: WorkflowState) -> dict[str, Any]:
-    profile = DatasetProfile.model_validate(state["profile"])
-    metric = _pick_metric(profile)
-    dimension = profile.dimensions[0] if profile.dimensions else profile.column_profiles[0].name
-    date = profile.dates[0] if profile.dates else None
-    kpis = state["business_analysis"].get("recommended_kpis", [])[:3]
-    components: list[ComponentSchema] = []
-
-    for index, candidate in enumerate(kpis):
-        field = candidate.get("field", metric)
-        aggregation = candidate.get("aggregation", "sum")
-        if field not in [c.name for c in profile.column_profiles]:
-            field = metric
-        components.append(
-            ComponentSchema(
-                id=f"kpi-{index + 1}",
-                type="kpi",
-                title=f"{aggregation.replace('_', ' ').title()} {field}",
-                query=QuerySchema(metric=field, aggregation=aggregation),
-                layout=LayoutSchema(x=index * 4, y=0, w=4, h=2),
-            )
-        )
-    if len(components) < 3:
-        components.append(
-            ComponentSchema(
-                id="kpi-records",
-                type="kpi",
-                title="Total Records",
-                query=QuerySchema(metric=profile.column_profiles[0].name, aggregation="count"),
-                layout=LayoutSchema(x=len(components) * 4, y=0, w=4, h=2),
-            )
-        )
-
-    components.extend(
-        [
-            ComponentSchema(
-                id="chart-segment",
-                type="bar",
-                title=f"{metric} by {dimension}",
-                subtitle="Top segments ranked by performance",
-                query=QuerySchema(group_by=dimension, metric=metric, aggregation="sum", limit=8),
-                layout=LayoutSchema(x=0, y=2, w=7, h=5),
-            ),
-            ComponentSchema(
-                id="chart-composition",
-                type="pie",
-                title=f"{dimension} mix",
-                subtitle="Share of records",
-                query=QuerySchema(group_by=dimension, metric=metric, aggregation="count", limit=6),
-                layout=LayoutSchema(x=7, y=2, w=5, h=5),
-            ),
-        ]
+    iteration = state.get("iteration", 0)
+    update_workflow_run(
+        state.get("run_id"),
+        node="bi_designer",
+        stage="BI Designer",
+        message=(
+            "Refining the dashboard from evaluation feedback."
+            if iteration
+            else "Building a KPI-first dashboard layout."
+        ),
+        progress=min(95, 14 + iteration * 18),
+        iteration=iteration,
     )
-    if date:
-        components.append(
-            ComponentSchema(
-                id="chart-trend",
-                type="line",
-                title=f"{metric} trend",
-                subtitle=f"Performance over {date}",
-                query=QuerySchema(group_by=date, metric=metric, aggregation="sum", sort="asc", limit=12),
-                layout=LayoutSchema(x=0, y=7, w=12, h=5),
+    data = DataAnalysisSpec.model_validate(state["data_analysis"])
+    business = BusinessAnalysisSpec.model_validate(state["business_analysis"])
+    kpi_results = (
+        KPIResultSet.model_validate(state["kpi_results"])
+        if state.get("kpi_results")
+        else calculate_kpis(
+            business.kpis,
+            read_dataset_tables(state["dataset_file_path"]),
+            data,
+        )
+    )
+    existing_payload = state.get("dashboard") or state.get("current_dashboard")
+
+    if existing_payload:
+        existing = DashboardSchema.model_validate(existing_payload)
+        existing.evaluation = None
+        existing.workflow_status = "draft"
+        existing.quality_score = 0
+        existing.critic_notes = []
+        required_kpis = {kpi.id for kpi in business.kpis[: min(4, len(business.kpis))]}
+        represented_kpis = {
+            component.metric_id
+            for component in existing.components
+            if component.type == "kpi" and component.metric_id
+        }
+        if not required_kpis.issubset(represented_kpis):
+            fallback = build_dashboard_fallback(
+                dataset_id=state["dataset_id"],
+                request=state["business_request"],
+                data=data,
+                business=business,
+                kpi_results=kpi_results,
+                logo_url=state.get("logo_url"),
+                preferences=state.get("user_preferences"),
+                brand_identity=state.get("brand_identity"),
+                logo_source=state.get("logo_source"),
+                revision=existing.revision + 1,
             )
+        elif state.get("user_feedback"):
+            fallback = apply_user_instruction(existing, state["user_feedback"] or "", data)
+        else:
+            fallback = apply_evaluation_refinement(
+                existing,
+                EvaluationResult.model_validate(state["evaluation"])
+                if state.get("evaluation")
+                else None,
+            )
+    else:
+        fallback = build_dashboard_fallback(
+            dataset_id=state["dataset_id"],
+            request=state["business_request"],
+            data=data,
+            business=business,
+            kpi_results=kpi_results,
+            logo_url=state.get("logo_url"),
+            preferences=state.get("user_preferences"),
+            brand_identity=state.get("brand_identity"),
+            logo_source=state.get("logo_source"),
         )
 
-    filters = [
-        FilterSchema(
-            id=f"filter-{i}",
-            field=field,
-            label=field,
-            type="select",
-            options=[],
+    designed = qwen_structured(
+        "bi_design",
+        "Design or refine only the affected dashboard components. Return DashboardSchema, never HTML.",
+        {
+            "request": state["business_request"],
+            "user_feedback": state.get("user_feedback"),
+            "data_analysis": data.model_dump(mode="json"),
+            "business_analysis": business.model_dump(mode="json"),
+            "kpi_results": kpi_results.model_dump(mode="json"),
+            "current_dashboard": fallback.model_dump(mode="json"),
+            "evaluation_feedback": state.get("evaluation"),
+        },
+        DashboardSchema,
+    )
+    candidate = designed if designed and _candidate_is_data_safe(designed, data, business) else fallback
+    candidate.dataset_id = state["dataset_id"]
+    candidate.logo_url = state.get("logo_url") or candidate.logo_url
+    candidate.logo_source = state.get("logo_source") or candidate.logo_source
+    if state.get("brand_identity"):
+        identity = state["brand_identity"] or {}
+        candidate.company_name = identity.get("company_name")
+        candidate.theme.update(
+            {
+                "primary": identity.get("primary_color", candidate.theme.get("primary", "#111827")),
+                "accent": identity.get("accent_color", candidate.theme.get("accent", "#00ADEF")),
+            }
         )
-        for i, field in enumerate(profile.dimensions[:3])
+    result_map = {result.kpi_id: result for result in kpi_results.results}
+    kpi_map = {kpi.id: kpi for kpi in business.kpis}
+    for component in candidate.components:
+        if component.metric_id in kpi_map:
+            kpi = kpi_map[component.metric_id]
+            component.formula = kpi.formula
+            computed = result_map.get(component.metric_id)
+            if computed:
+                component.computation_status = computed.status
+                component.computation_message = computed.message
+                component.computation_evidence = computed.evidence
+                component.computed_value = (
+                    computed.value if computed.status == "computed" else None
+                )
+            if (
+                kpi.formula
+                and kpi.formula.kind in {"ratio", "period_growth"}
+                and kpi.formula.multiplier == 100
+            ):
+                component.style["unit"] = "%"
+    candidate.components = [
+        component
+        for component in candidate.components
+        if not (
+            component.type == "kpi"
+            and component.metric_id in result_map
+            and result_map[component.metric_id].status != "computed"
+        )
     ]
-    title_seed = state["business_request"].split(".")[0].strip()
-    schema = DashboardSchema(
-        title=(title_seed[:54] or "Business Performance Overview"),
-        description="An AI-designed view of the metrics and segments that matter most.",
-        dataset_id=state["dataset_id"],
-        theme={"primary": "#2563EB", "accent": "#14B8A6", "background": "#F4F7FB", "surface": "#FFFFFF"},
-        filters=filters,
-        components=components,
-        insights=[
-            "Use filters to compare high-performing segments and isolate exceptions.",
-            "Review concentration in the largest category before setting targets.",
-            "Validate KPI definitions with metric owners before operational rollout.",
-        ],
-        quality_score=82,
-        critic_notes=[],
+    candidate.insights = []
+    candidate.evaluation = None
+    candidate.workflow_status = "draft"
+    candidate = normalize_layout(candidate)
+    return {"dashboard": candidate.model_dump(mode="json")}
+
+
+def render_preview(state: WorkflowState) -> dict[str, Any]:
+    update_workflow_run(
+        state.get("run_id"),
+        node="render_preview",
+        stage="Dashboard render",
+        message="Rendering charts and capturing the dashboard for visual review.",
+        progress=min(96, 16 + state.get("iteration", 0) * 18),
+        iteration=state.get("iteration", 0),
     )
-    return {"dashboard": schema.model_dump()}
-
-
-def critic(state: WorkflowState) -> dict[str, Any]:
     dashboard = DashboardSchema.model_validate(state["dashboard"])
-    notes: list[str] = []
-    score = 100
-    if len(dashboard.components) < 5:
-        notes.append("Add another analytical view to improve coverage.")
-        score -= 10
-    if not any(component.type == "line" for component in dashboard.components):
-        notes.append("No reliable date field was found, so trend analysis is omitted.")
-        score -= 6
-    if len(dashboard.filters) == 0:
-        notes.append("Add a categorical filter for interactive segmentation.")
-        score -= 8
-    if len([c for c in dashboard.components if c.type == "pie"]) > 1:
-        notes.append("Limit pie charts to a single composition view.")
-        score -= 5
-    notes.append("Dashboard passed schema, chart-fit, and information hierarchy checks.")
-    dashboard.quality_score = max(score, 0)
-    dashboard.critic_notes = notes
-    return {"dashboard": dashboard.model_dump(), "critique": {"score": score, "notes": notes}}
+    tables = read_dataset_tables(state["dataset_file_path"])
+    rendered_dashboard, artifact = render_dashboard(dashboard, tables)
+    screenshot, dom_metrics, capture_error = capture_dashboard_html(artifact.html)
+    artifact.screenshot_base64 = screenshot
+    artifact.dom_metrics = dom_metrics
+    artifact.capture_error = capture_error
+    return {
+        "dashboard": rendered_dashboard.model_dump(mode="json"),
+        "render_artifact": artifact.model_dump(mode="json"),
+    }
+
+
+def bi_evaluator(state: WorkflowState) -> dict[str, Any]:
+    iteration = min(state.get("iteration", 0) + 1, settings.max_workflow_iterations)
+    update_workflow_run(
+        state.get("run_id"),
+        node="bi_evaluator",
+        stage="BI Evaluation",
+        message=f"Checking data, requirements, layout, and visual quality · iteration {iteration}/5.",
+        progress=min(98, 18 + (iteration - 1) * 18),
+        iteration=iteration,
+    )
+    dashboard = DashboardSchema.model_validate(state["dashboard"])
+    data = DataAnalysisSpec.model_validate(state["data_analysis"])
+    business = BusinessAnalysisSpec.model_validate(state["business_analysis"])
+    artifact = RenderArtifact.model_validate(state["render_artifact"])
+
+    deterministic = evaluate_dashboard(
+        dashboard,
+        data,
+        business,
+        artifact,
+        iteration=iteration,
+        max_iterations=settings.max_workflow_iterations,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        qwen_future = executor.submit(
+            qwen_structured,
+            "bi_evaluation",
+            "Review requirement alignment only. Do not redesign and do not override deterministic data checks.",
+            {
+                "user_request": state["business_request"],
+                "business_analysis": business.model_dump(mode="json"),
+                "dashboard": dashboard.model_dump(mode="json"),
+                "render_summary": artifact.render_summary,
+                "deterministic_evaluation": deterministic.model_dump(mode="json"),
+            },
+            EvaluationResult,
+        )
+        visual_future = executor.submit(
+            qwen_vision_structured,
+            "bi_evaluation",
+            "Evaluate the rendered BI dashboard screenshot for layout, typography, branding, hierarchy, and usability.",
+            {
+                "user_request": state["business_request"],
+                "render_summary": artifact.render_summary,
+                "dom_metrics": artifact.dom_metrics,
+                "dashboard_title": dashboard.title,
+                "user_preferences": state.get("user_preferences"),
+            },
+            artifact.screenshot_base64,
+            VisualReview,
+        )
+        qwen_review = qwen_future.result()
+        visual_review = visual_future.result()
+    # Qwen may add visual/business observations, but deterministic validation owns
+    # data integrity, iteration count, routing, and publication status.
+    if qwen_review:
+        known_ids = {issue.id for issue in deterministic.detected_issues}
+        added = False
+        for issue in qwen_review.detected_issues:
+            if issue.id not in known_ids and issue.issue_category != "data_integrity":
+                if iteration >= 2 and issue.severity == "high":
+                    issue.severity = "medium"
+                deterministic.detected_issues.append(issue)
+                added = True
+        if added:
+            deductions = {"low": 1, "medium": 3, "high": 8}
+            scores = {
+                "visual_quality": 50,
+                "business_alignment": 25,
+                "data_integrity": deterministic.category_scores["data_integrity"],
+                "usability": 10,
+            }
+            for issue in deterministic.detected_issues:
+                if issue.issue_category != "data_integrity":
+                    score_key = {
+                        "visual": "visual_quality",
+                        "business_requirement": "business_alignment",
+                        "usability": "usability",
+                    }[issue.issue_category]
+                    scores[score_key] -= deductions[issue.severity]
+            deterministic.category_scores = {
+                category: max(score, 0) for category, score in scores.items()
+            }
+            deterministic.overall_score = sum(deterministic.category_scores.values())
+            blocking = any(issue.severity == "high" for issue in deterministic.detected_issues)
+            if deterministic.overall_score >= 80 and not blocking:
+                deterministic.passed = True
+                deterministic.status = "passed"
+                deterministic.routing_decision = "publish"
+            elif iteration >= settings.max_workflow_iterations:
+                deterministic.passed = False
+                deterministic.status = "needs_user_review"
+                deterministic.routing_decision = "human_review"
+            else:
+                deterministic.passed = False
+                deterministic.status = "needs_refinement"
+                categories = {
+                    issue.issue_category for issue in deterministic.detected_issues
+                }
+                if "data_integrity" in categories:
+                    deterministic.routing_decision = "refine_data"
+                elif "business_requirement" in categories:
+                    deterministic.routing_decision = "refine_business"
+                else:
+                    deterministic.routing_decision = "refine_design"
+    if visual_review:
+        known_ids = {issue.id for issue in deterministic.detected_issues}
+        for issue in visual_review.issues:
+            if (
+                issue.id not in known_ids
+                and issue.issue_category in {"visual", "usability"}
+            ):
+                if iteration >= 2 and issue.severity == "high":
+                    issue.severity = "medium"
+                deterministic.detected_issues.append(issue)
+        # Reuse deterministic scoring/routing by applying the same bounded deductions.
+        scores = {
+            "visual_quality": 50,
+            "business_alignment": deterministic.category_scores["business_alignment"],
+            "data_integrity": deterministic.category_scores["data_integrity"],
+            "usability": 10,
+        }
+        deductions = {"low": 1, "medium": 3, "high": 8}
+        for issue in deterministic.detected_issues:
+            if issue.issue_category == "visual":
+                scores["visual_quality"] -= deductions[issue.severity]
+            elif issue.issue_category == "usability":
+                scores["usability"] -= deductions[issue.severity]
+        deterministic.category_scores = {
+            category: max(score, 0) for category, score in scores.items()
+        }
+        deterministic.overall_score = sum(deterministic.category_scores.values())
+        blocking = any(issue.severity == "high" for issue in deterministic.detected_issues)
+        deterministic.passed = deterministic.overall_score >= 80 and not blocking
+        if deterministic.passed:
+            deterministic.status = "passed"
+            deterministic.routing_decision = "publish"
+        elif iteration >= settings.max_workflow_iterations:
+            deterministic.status = "needs_user_review"
+            deterministic.routing_decision = "human_review"
+        else:
+            deterministic.status = "needs_refinement"
+            categories = {
+                issue.issue_category for issue in deterministic.detected_issues
+            }
+            if "data_integrity" in categories:
+                deterministic.routing_decision = "refine_data"
+            elif "business_requirement" in categories:
+                deterministic.routing_decision = "refine_business"
+            else:
+                deterministic.routing_decision = "refine_design"
+
+    dashboard.evaluation = deterministic
+    dashboard.workflow_status = deterministic.status
+    dashboard.quality_score = deterministic.overall_score
+    dashboard.critic_notes = [
+        f"[{issue.severity}] {issue.description} → {issue.recommended_action}"
+        for issue in deterministic.detected_issues
+    ] or ["Dashboard passed visual, data, requirement, and usability validation."]
+    next_stage = {
+        "publish": "Dashboard approved",
+        "human_review": "Publishing best available result",
+        "refine_data": "Returning to Data Analyst",
+        "refine_business": "Returning to Business Analyst",
+        "refine_design": "Returning to BI Designer",
+    }[deterministic.routing_decision]
+    update_workflow_run(
+        state.get("run_id"),
+        stage=next_stage,
+        message=(
+            "Evaluation passed. Preparing the result."
+            if deterministic.routing_decision == "publish"
+            else (
+                "Five iterations completed. Publishing the best result for your review."
+                if deterministic.routing_decision == "human_review"
+                else f"Evaluation found issues. {next_stage} for targeted refinement."
+            )
+        ),
+        iteration=iteration,
+        progress=96 if deterministic.routing_decision in {"publish", "human_review"} else 90,
+    )
+    return {
+        "dashboard": dashboard.model_dump(mode="json"),
+        "evaluation": deterministic.model_dump(mode="json"),
+        "iteration": iteration,
+    }
+
+
+def route_evaluation(state: WorkflowState) -> str:
+    evaluation = EvaluationResult.model_validate(state["evaluation"])
+    return evaluation.routing_decision
 
 
 graph = StateGraph(WorkflowState)
+graph.add_node("request_router", request_router)
 graph.add_node("data_analyst", data_analyst)
 graph.add_node("business_analyst", business_analyst)
+graph.add_node("kpi_calculator", kpi_calculator)
 graph.add_node("bi_designer", bi_designer)
-graph.add_node("critic", critic)
-graph.set_entry_point("data_analyst")
+graph.add_node("render_preview", render_preview)
+graph.add_node("bi_evaluator", bi_evaluator)
+
+graph.set_entry_point("request_router")
+graph.add_conditional_edges(
+    "request_router",
+    route_request,
+    {
+        "data": "data_analyst",
+        "business": "business_analyst",
+        "design": "bi_designer",
+    },
+)
 graph.add_edge("data_analyst", "business_analyst")
-graph.add_edge("business_analyst", "bi_designer")
-graph.add_edge("bi_designer", "critic")
-graph.add_edge("critic", END)
+graph.add_edge("business_analyst", "kpi_calculator")
+graph.add_edge("kpi_calculator", "bi_designer")
+graph.add_edge("bi_designer", "render_preview")
+graph.add_edge("render_preview", "bi_evaluator")
+graph.add_conditional_edges(
+    "bi_evaluator",
+    route_evaluation,
+    {
+        "publish": END,
+        "human_review": END,
+        "refine_data": "data_analyst",
+        "refine_business": "business_analyst",
+        "refine_design": "bi_designer",
+    },
+)
+
 dashboard_workflow = graph.compile()
-
-
-def modify_schema(schema: dict[str, Any], instruction: str) -> dict[str, Any]:
-    dashboard = DashboardSchema.model_validate(deepcopy(schema))
-    llm_result = _llm_json(
-        "You modify a Dashboard JSON schema. Preserve its exact shape and field validity. Apply the instruction using only existing dataset fields.",
-        {"instruction": instruction, "dashboard": dashboard.model_dump()},
-    )
-    if llm_result:
-        return DashboardSchema.model_validate(llm_result).model_dump()
-
-    lowered = instruction.lower()
-    if "dark" in lowered:
-        dashboard.theme.update(
-            {"primary": "#60A5FA", "accent": "#2DD4BF", "background": "#07111F", "surface": "#101C2E"}
-        )
-    if "purple" in lowered:
-        dashboard.theme.update({"primary": "#7C3AED", "accent": "#EC4899"})
-    if "bar" in lowered:
-        for component in dashboard.components:
-            if component.type in {"line", "pie", "area"}:
-                component.type = "bar"
-    if "line" in lowered:
-        for component in dashboard.components:
-            if component.type == "bar":
-                component.type = "line"
-                break
-    if "compact" in lowered:
-        for component in dashboard.components:
-            component.layout.h = max(2, component.layout.h - 1)
-    dashboard.critic_notes = [f"Applied refinement: {instruction}"]
-    return dashboard.model_dump()
