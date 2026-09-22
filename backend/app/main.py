@@ -1,15 +1,21 @@
 from pathlib import Path
+from threading import Thread
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from .agents.workflow import dashboard_workflow, modify_schema
+from .agent_tools.dashboard import prepare_dashboard_for_display, render_dashboard
+from .agents.workflow import dashboard_workflow
 from .config import settings
-from .database import Base, engine, get_db
-from .models import Dashboard, Dataset
+from .database import Base, SessionLocal, engine, get_db
+from .models import Dashboard, DashboardMessage, DashboardRun, Dataset, DatasetVersion
 from .schemas import (
+    ChatRefinementRequest,
+    ChatRefinementResponse,
     DashboardSchema,
     DatasetResponse,
     GenerateDashboardRequest,
@@ -18,11 +24,25 @@ from .schemas import (
     ModifyDashboardRequest,
     QuerySchema,
 )
-from .services.data_service import execute_query, profile_dataframe, read_dataframe
+from .services.data_service import execute_query
+from .services.data_service import (
+    discover_file_tables,
+    profile_dataset_tables,
+    read_dataset_tables,
+    write_dataset_manifest,
+)
+from .services.brand_service import infer_brand_identity, resolve_brand_assets
+from .services.report_template_service import list_report_templates
+from .services.workflow_progress import (
+    create_workflow_run,
+    fail_workflow_run,
+    get_workflow_run,
+    update_workflow_run,
+)
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title=settings.app_name, version="0.1.0")
+app = FastAPI(title=settings.app_name, version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin, "http://127.0.0.1:5173"],
@@ -30,11 +50,228 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
+
+
+def _latest_run(db: Session, dashboard_id: int) -> DashboardRun | None:
+    return (
+        db.query(DashboardRun)
+        .filter(DashboardRun.dashboard_id == dashboard_id)
+        .order_by(DashboardRun.id.desc())
+        .first()
+    )
+
+
+def _workflow_input(
+    dataset: Dataset,
+    request: str,
+    *,
+    current_dashboard: dict | None = None,
+    data_analysis: dict | None = None,
+    business_analysis: dict | None = None,
+    feedback: str | None = None,
+    logo_url: str | None = None,
+    logo_source: str | None = None,
+    brand_identity: dict | None = None,
+    preferences: str | None = None,
+    run_id: str | None = None,
+) -> dict:
+    payload = {
+        "dataset_id": dataset.id,
+        "dataset_file_path": dataset.file_path,
+        "profile": dataset.profile,
+        "business_request": request,
+        "logo_url": logo_url,
+        "logo_source": logo_source,
+        "brand_identity": brand_identity,
+        "user_preferences": preferences,
+        "user_feedback": feedback,
+        "current_dashboard": current_dashboard,
+        "iteration": 0,
+    }
+    if run_id:
+        payload["run_id"] = run_id
+    if data_analysis:
+        payload["data_analysis"] = data_analysis
+    if business_analysis:
+        payload["business_analysis"] = business_analysis
+    return payload
+
+
+def _save_run(db: Session, dashboard_id: int, result: dict) -> DashboardRun:
+    evaluation = result["evaluation"]
+    run = DashboardRun(
+        dashboard_id=dashboard_id,
+        data_analysis=result["data_analysis"],
+        business_analysis=result["business_analysis"],
+        evaluation=evaluation,
+        iteration_count=result["iteration"],
+        status=evaluation["status"],
+    )
+    db.add(run)
+    return run
+
+
+def _persist_new_dashboard(
+    db: Session,
+    dataset: Dataset,
+    business_request: str,
+    result: dict,
+) -> tuple[Dashboard, DashboardSchema]:
+    schema = DashboardSchema.model_validate(result["dashboard"])
+    dashboard = Dashboard(
+        dataset_id=dataset.id,
+        title=schema.title,
+        business_request=business_request,
+        schema=schema.model_dump(mode="json"),
+    )
+    db.add(dashboard)
+    db.flush()
+    _save_run(db, dashboard.id, result)
+    db.commit()
+    db.refresh(dashboard)
+    return dashboard, schema
+
+
+def _brand_context(
+    business_request: str,
+    uploaded_logo_url: str | None,
+) -> tuple[str | None, dict | None, str | None]:
+    if uploaded_logo_url:
+        identity = infer_brand_identity(business_request)
+        return (
+            uploaded_logo_url,
+            identity.model_dump(mode="json") if identity else None,
+            "uploaded",
+        )
+    return resolve_brand_assets(business_request)
+
+
+def _run_generate_background(run_id: str, payload: dict) -> None:
+    try:
+        update_workflow_run(
+            run_id,
+            status="running",
+            node="brand_identity",
+            stage="Brand identity",
+            message="Preparing the company identity and logo.",
+            progress=2,
+        )
+        with SessionLocal() as db:
+            dataset = db.get(Dataset, payload["dataset_id"])
+            if not dataset:
+                raise ValueError("Dataset not found.")
+            logo_url, brand_identity, logo_source = _brand_context(
+                payload["business_request"],
+                payload.get("logo_url"),
+            )
+            result = dashboard_workflow.invoke(
+                _workflow_input(
+                    dataset,
+                    payload["business_request"],
+                    logo_url=logo_url,
+                    logo_source=logo_source,
+                    brand_identity=brand_identity,
+                    run_id=run_id,
+                ),
+                config={"recursion_limit": 60},
+            )
+            dashboard, schema = _persist_new_dashboard(
+                db,
+                dataset,
+                payload["business_request"],
+                result,
+            )
+        update_workflow_run(
+            run_id,
+            status="completed",
+            node="published",
+            stage="Dashboard ready",
+            message="The evaluated dashboard is ready for review.",
+            progress=100,
+            iteration=result["iteration"],
+            result={
+                "dashboard_id": dashboard.id,
+                "dashboard": schema.model_dump(mode="json"),
+            },
+        )
+    except Exception as exc:
+        fail_workflow_run(run_id, str(exc))
+
+
+def _run_chat_background(run_id: str, dashboard_id: int, message: str) -> None:
+    try:
+        with SessionLocal() as db:
+            record = db.get(Dashboard, dashboard_id)
+            if not record:
+                raise ValueError("Dashboard not found.")
+            dataset = db.get(Dataset, record.dataset_id)
+            previous_run = _latest_run(db, record.id)
+            if not dataset or not previous_run:
+                raise ValueError("Dashboard workflow context is unavailable.")
+            current = DashboardSchema.model_validate(record.schema)
+            brand_identity = (
+                {
+                    "company_name": current.company_name,
+                    "primary_color": current.theme.get("primary", "#111827"),
+                    "accent_color": current.theme.get("accent", "#00ADEF"),
+                }
+                if current.company_name
+                else None
+            )
+            result = dashboard_workflow.invoke(
+                _workflow_input(
+                    dataset,
+                    record.business_request,
+                    current_dashboard=current.model_dump(mode="json"),
+                    data_analysis=previous_run.data_analysis,
+                    business_analysis=previous_run.business_analysis,
+                    feedback=message,
+                    logo_url=current.logo_url,
+                    logo_source=current.logo_source,
+                    brand_identity=brand_identity,
+                    run_id=run_id,
+                ),
+                config={"recursion_limit": 60},
+            )
+            schema = DashboardSchema.model_validate(result["dashboard"])
+            record.title = schema.title
+            record.schema = schema.model_dump(mode="json")
+            _save_run(db, record.id, result)
+            db.add(DashboardMessage(dashboard_id=record.id, role="user", content=message))
+            assistant_message = (
+                f"Revision {schema.revision} is ready with status {schema.workflow_status} "
+                f"and score {schema.quality_score}/100."
+            )
+            db.add(
+                DashboardMessage(
+                    dashboard_id=record.id,
+                    role="assistant",
+                    content=assistant_message,
+                )
+            )
+            db.commit()
+        update_workflow_run(
+            run_id,
+            status="completed",
+            node="published",
+            stage="Revision ready",
+            message="The evaluated revision is ready.",
+            progress=100,
+            iteration=result["iteration"],
+            result={
+                "dashboard_id": dashboard_id,
+                "message": assistant_message,
+                "dashboard": schema.model_dump(mode="json"),
+            },
+        )
+    except Exception as exc:
+        fail_workflow_run(run_id, str(exc))
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mode": "openai" if settings.openai_api_key else "heuristic"}
+    return {"status": "ok", "mode": "qwen" if settings.qwen_api_key else "heuristic"}
 
 
 @app.get("/datasets", response_model=list[DatasetResponse])
@@ -42,28 +279,125 @@ def list_datasets(db: Session = Depends(get_db)):
     return db.query(Dataset).order_by(Dataset.created_at.desc()).all()
 
 
+@app.get("/datasets/{dataset_id}", response_model=DatasetResponse)
+def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    dataset = db.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(404, "Dataset not found.")
+    return dataset
+
+
+@app.get("/datasets/{dataset_id}/preview")
+def preview_dataset(
+    dataset_id: int,
+    table_id: str | None = None,
+    limit: int = Query(default=25, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    dataset = db.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(404, "Dataset not found.")
+    tables = read_dataset_tables(dataset.file_path)
+    selected_id = table_id or next(iter(tables), None)
+    if not selected_id or selected_id not in tables:
+        raise HTTPException(404, "Table not found.")
+    frame = tables[selected_id].head(limit).copy()
+    frame = frame.astype(object).where(frame.notna(), None)
+    return {
+        "dataset_id": dataset.id,
+        "table_id": selected_id,
+        "columns": [str(column) for column in frame.columns],
+        "rows": frame.to_dict(orient="records"),
+        "total_rows": len(tables[selected_id]),
+    }
+
+
+def _archive_dataset_version(db: Session, dataset: Dataset, operation: str) -> None:
+    version_count = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.dataset_id == dataset.id)
+        .count()
+    )
+    db.add(
+        DatasetVersion(
+            dataset_id=dataset.id,
+            version=version_count + 1,
+            file_path=dataset.file_path,
+            row_count=dataset.row_count,
+            column_count=dataset.column_count,
+            profile=dataset.profile,
+            operation=operation,
+        )
+    )
+
+
+@app.get("/datasets/{dataset_id}/versions")
+def dataset_versions(dataset_id: int, db: Session = Depends(get_db)):
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(404, "Dataset not found.")
+    versions = (
+        db.query(DatasetVersion)
+        .filter(DatasetVersion.dataset_id == dataset_id)
+        .order_by(DatasetVersion.version.desc())
+        .all()
+    )
+    return {
+        "versions": [
+            {
+                "id": item.id,
+                "version": item.version,
+                "operation": item.operation,
+                "row_count": item.row_count,
+                "column_count": item.column_count,
+                "created_at": item.created_at,
+            }
+            for item in versions
+        ]
+    }
+
+
 @app.post("/upload_dataset", response_model=DatasetResponse)
-async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".csv", ".xlsx", ".xls"}:
-        raise HTTPException(400, "Upload a CSV or Excel file.")
-    content = await file.read()
-    if len(content) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(413, f"File exceeds {settings.max_upload_mb} MB.")
-    path = settings.upload_dir / f"{uuid4().hex}{suffix}"
-    path.write_bytes(content)
+async def upload_dataset(
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    if not files:
+        raise HTTPException(400, "Upload at least one CSV or Excel file.")
+    entries: list[dict] = []
+    used_ids: set[str] = set()
     try:
-        df = read_dataframe(path)
-        if df.empty:
-            raise ValueError("The file contains no rows.")
-        profile = profile_dataframe(df)
+        for file in files:
+            suffix = Path(file.filename or "").suffix.lower()
+            if suffix not in {".csv", ".xlsx", ".xls"}:
+                raise ValueError(f"{file.filename}: only CSV and Excel files are supported.")
+            content = await file.read()
+            if len(content) > settings.max_upload_mb * 1024 * 1024:
+                raise ValueError(f"{file.filename} exceeds {settings.max_upload_mb} MB.")
+            path = settings.upload_dir / f"{uuid4().hex}{suffix}"
+            path.write_bytes(content)
+            entries.extend(
+                discover_file_tables(
+                    path,
+                    file.filename or path.name,
+                    used_ids,
+                )
+            )
+        manifest = write_dataset_manifest(
+            entries,
+            settings.upload_dir / f"dataset-{uuid4().hex}.json",
+        )
+        tables = read_dataset_tables(manifest)
+        empty = [table_id for table_id, frame in tables.items() if frame.empty]
+        if empty:
+            raise ValueError(f"Empty tables: {', '.join(empty)}")
+        profile = profile_dataset_tables(tables, entries)
     except Exception as exc:
-        path.unlink(missing_ok=True)
         raise HTTPException(400, f"Could not read dataset: {exc}") from exc
 
+    names = [file.filename or "dataset" for file in files]
     dataset = Dataset(
-        name=file.filename or path.name,
-        file_path=str(path),
+        name=names[0] if len(names) == 1 else f"{names[0]} + {len(names) - 1} more",
+        file_path=str(manifest),
         row_count=profile.rows,
         column_count=profile.columns,
         profile=profile.model_dump(),
@@ -74,30 +408,290 @@ async def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get
     return dataset
 
 
+@app.post("/datasets/{dataset_id}/replace", response_model=DatasetResponse)
+async def replace_dataset(
+    dataset_id: int,
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    dataset = db.get(Dataset, dataset_id)
+    if not dataset:
+        raise HTTPException(404, "Dataset not found.")
+    if not files:
+        raise HTTPException(400, "Upload at least one CSV or Excel file.")
+
+    entries: list[dict] = []
+    used_ids: set[str] = set()
+    try:
+        for file in files:
+            suffix = Path(file.filename or "").suffix.lower()
+            if suffix not in {".csv", ".xlsx", ".xls"}:
+                raise ValueError(f"{file.filename}: only CSV and Excel files are supported.")
+            content = await file.read()
+            if len(content) > settings.max_upload_mb * 1024 * 1024:
+                raise ValueError(f"{file.filename} exceeds {settings.max_upload_mb} MB.")
+            path = settings.upload_dir / f"{uuid4().hex}{suffix}"
+            path.write_bytes(content)
+            entries.extend(discover_file_tables(path, file.filename or path.name, used_ids))
+
+        old_table_ids = [table["id"] for table in dataset.profile.get("tables", [])]
+        if len(old_table_ids) == len(entries):
+            for entry, old_id in zip(entries, old_table_ids, strict=True):
+                entry["id"] = old_id
+        manifest = write_dataset_manifest(
+            entries,
+            settings.upload_dir / f"dataset-{uuid4().hex}.json",
+        )
+        tables = read_dataset_tables(manifest)
+        if any(frame.empty for frame in tables.values()):
+            raise ValueError("Replacement contains an empty table.")
+
+        required: dict[str, set[str]] = {}
+        dashboards = db.query(Dashboard).filter(Dashboard.dataset_id == dataset.id).all()
+        for dashboard in dashboards:
+            schema = DashboardSchema.model_validate(dashboard.schema)
+            for filter_spec in schema.filters:
+                required.setdefault(filter_spec.table_id, set()).add(filter_spec.field)
+            for component in schema.components:
+                required.setdefault(component.query.table_id, set()).add(component.query.metric)
+                if component.query.group_by:
+                    required[component.query.table_id].add(component.query.group_by)
+        missing = [
+            f"{table_id}.{field}"
+            for table_id, fields in required.items()
+            for field in fields
+            if table_id not in tables or field not in tables[table_id].columns
+        ]
+        if missing:
+            raise ValueError(
+                "Replacement would break existing dashboards. Missing fields: "
+                + ", ".join(missing[:12])
+            )
+        profile = profile_dataset_tables(tables, entries)
+    except Exception as exc:
+        raise HTTPException(400, f"Could not replace dataset: {exc}") from exc
+
+    _archive_dataset_version(db, dataset, "replace")
+    dataset.name = files[0].filename or dataset.name
+    dataset.file_path = str(manifest)
+    dataset.row_count = profile.rows
+    dataset.column_count = profile.columns
+    dataset.profile = profile.model_dump()
+    db.commit()
+    db.refresh(dataset)
+    return dataset
+
+
+@app.post("/upload_logo")
+async def upload_logo(request: Request, file: UploadFile = File(...)):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+        raise HTTPException(400, "Upload a PNG, JPG, WEBP, or SVG logo.")
+    content = await file.read()
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(413, "Logo exceeds 5 MB.")
+    name = f"logo-{uuid4().hex}{suffix}"
+    (settings.upload_dir / name).write_bytes(content)
+    return {"logo_url": str(request.base_url).rstrip("/") + f"/uploads/{name}"}
+
+
 @app.post("/generate_dashboard", response_model=GenerateDashboardResponse)
 def generate_dashboard(payload: GenerateDashboardRequest, db: Session = Depends(get_db)):
     dataset = db.get(Dataset, payload.dataset_id)
     if not dataset:
         raise HTTPException(404, "Dataset not found.")
+    logo_url, brand_identity, logo_source = _brand_context(
+        payload.business_request,
+        payload.logo_url,
+    )
     result = dashboard_workflow.invoke(
-        {
-            "dataset_id": dataset.id,
-            "profile": dataset.profile,
-            "business_request": payload.business_request,
-            "iteration": 0,
-        }
+        _workflow_input(
+            dataset,
+            payload.business_request,
+            logo_url=logo_url,
+            logo_source=logo_source,
+            brand_identity=brand_identity,
+        ),
+        config={"recursion_limit": 60},
+    )
+    dashboard, schema = _persist_new_dashboard(
+        db,
+        dataset,
+        payload.business_request,
+        result,
+    )
+    return {"dashboard_id": dashboard.id, "dashboard": schema}
+
+
+@app.post("/workflow_runs/generate")
+def start_generate_workflow(payload: GenerateDashboardRequest, db: Session = Depends(get_db)):
+    if not db.get(Dataset, payload.dataset_id):
+        raise HTTPException(404, "Dataset not found.")
+    run = create_workflow_run("generate")
+    Thread(
+        target=_run_generate_background,
+        args=(run["run_id"], payload.model_dump(mode="json")),
+        daemon=True,
+    ).start()
+    return run
+
+
+@app.post("/dashboards/{dashboard_id}/workflow_runs")
+def start_chat_workflow(
+    dashboard_id: int,
+    payload: ChatRefinementRequest,
+    db: Session = Depends(get_db),
+):
+    if not db.get(Dashboard, dashboard_id):
+        raise HTTPException(404, "Dashboard not found.")
+    run = create_workflow_run("refine")
+    Thread(
+        target=_run_chat_background,
+        args=(run["run_id"], dashboard_id, payload.message),
+        daemon=True,
+    ).start()
+    return run
+
+
+@app.get("/workflow_runs/{run_id}")
+def workflow_run_status(run_id: str):
+    run = get_workflow_run(run_id)
+    if not run:
+        raise HTTPException(404, "Workflow run not found.")
+    return run
+
+
+@app.get("/dashboards/{dashboard_id}", response_model=GenerateDashboardResponse)
+def get_dashboard(dashboard_id: int, db: Session = Depends(get_db)):
+    record = db.get(Dashboard, dashboard_id)
+    if not record:
+        raise HTTPException(404, "Dashboard not found.")
+    return {
+        "dashboard_id": record.id,
+        "dashboard": prepare_dashboard_for_display(
+            DashboardSchema.model_validate(record.schema)
+        ),
+    }
+
+
+@app.get("/dashboards")
+def list_dashboards(db: Session = Depends(get_db)):
+    records = db.query(Dashboard).order_by(Dashboard.updated_at.desc()).all()
+    return {
+        "dashboards": [
+            {
+                "id": record.id,
+                "title": record.title,
+                "dataset_id": record.dataset_id,
+                "business_request": record.business_request,
+                "component_count": len(record.schema.get("components", [])),
+                "filter_count": len(record.schema.get("filters", [])),
+                "status": record.schema.get("workflow_status", "draft"),
+                "quality_score": record.schema.get("quality_score", 0),
+                "updated_at": record.updated_at,
+            }
+            for record in records
+        ]
+    }
+
+
+@app.get("/report_templates")
+def report_templates():
+    return {"templates": list_report_templates()}
+
+
+@app.post(
+    "/dashboards/{dashboard_id}/chat",
+    response_model=ChatRefinementResponse,
+)
+def refine_with_chat(
+    dashboard_id: int,
+    payload: ChatRefinementRequest,
+    db: Session = Depends(get_db),
+):
+    record = db.get(Dashboard, dashboard_id)
+    if not record:
+        raise HTTPException(404, "Dashboard not found.")
+    dataset = db.get(Dataset, record.dataset_id)
+    run = _latest_run(db, record.id)
+    if not dataset or not run:
+        raise HTTPException(409, "Dashboard workflow context is unavailable.")
+    current = DashboardSchema.model_validate(record.schema)
+    result = dashboard_workflow.invoke(
+        _workflow_input(
+            dataset,
+            record.business_request,
+            current_dashboard=current.model_dump(mode="json"),
+            data_analysis=run.data_analysis,
+            business_analysis=run.business_analysis,
+            feedback=payload.message,
+            logo_url=current.logo_url,
+        ),
+        config={"recursion_limit": 60},
     )
     schema = DashboardSchema.model_validate(result["dashboard"])
-    dashboard = Dashboard(
-        dataset_id=dataset.id,
-        title=schema.title,
-        business_request=payload.business_request,
-        schema=schema.model_dump(),
+    record.title = schema.title
+    record.schema = schema.model_dump(mode="json")
+    _save_run(db, record.id, result)
+    db.add(DashboardMessage(dashboard_id=record.id, role="user", content=payload.message))
+    assistant_message = (
+        f"Revision {schema.revision} is ready with status {schema.workflow_status} "
+        f"and score {schema.quality_score}/100."
     )
-    db.add(dashboard)
+    db.add(DashboardMessage(dashboard_id=record.id, role="assistant", content=assistant_message))
     db.commit()
-    db.refresh(dashboard)
-    return {"dashboard_id": dashboard.id, "dashboard": schema}
+    return {
+        "dashboard_id": record.id,
+        "message": assistant_message,
+        "dashboard": schema,
+    }
+
+
+@app.get("/dashboards/{dashboard_id}/messages")
+def dashboard_messages(dashboard_id: int, db: Session = Depends(get_db)):
+    if not db.get(Dashboard, dashboard_id):
+        raise HTTPException(404, "Dashboard not found.")
+    messages = (
+        db.query(DashboardMessage)
+        .filter(DashboardMessage.dashboard_id == dashboard_id)
+        .order_by(DashboardMessage.id.asc())
+        .all()
+    )
+    return {
+        "messages": [
+            {"id": item.id, "role": item.role, "content": item.content}
+            for item in messages
+        ]
+    }
+
+
+@app.get("/dashboards/{dashboard_id}/download")
+def download_dashboard(
+    dashboard_id: int,
+    template_id: str = Query(default="generic-executive"),
+    db: Session = Depends(get_db),
+):
+    record = db.get(Dashboard, dashboard_id)
+    if not record:
+        raise HTTPException(404, "Dashboard not found.")
+    dataset = db.get(Dataset, record.dataset_id)
+    if not dataset:
+        raise HTTPException(404, "Dataset not found.")
+    schema = DashboardSchema.model_validate(record.schema)
+    try:
+        rendered, artifact = render_dashboard(
+            schema,
+            read_dataset_tables(dataset.file_path),
+            template_id=template_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    safe_name = "".join(character if character.isalnum() else "-" for character in rendered.title).strip("-")
+    return Response(
+        content=artifact.html,
+        media_type="text/html",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name or "dashboard"}.html"'},
+    )
 
 
 @app.post("/modify_dashboard", response_model=GenerateDashboardResponse)
@@ -107,14 +701,18 @@ def modify_dashboard(payload: ModifyDashboardRequest, db: Session = Depends(get_
         raise HTTPException(404, "Dashboard not found.")
     if payload.dashboard:
         schema = payload.dashboard
-    elif payload.instruction:
-        schema = DashboardSchema.model_validate(modify_schema(record.schema, payload.instruction))
-    else:
-        raise HTTPException(400, "Provide an instruction or dashboard schema.")
-    record.title = schema.title
-    record.schema = schema.model_dump()
-    db.commit()
-    return {"dashboard_id": record.id, "dashboard": schema}
+        record.title = schema.title
+        record.schema = schema.model_dump(mode="json")
+        db.commit()
+        return {"dashboard_id": record.id, "dashboard": schema}
+    if payload.instruction:
+        refined = refine_with_chat(
+            record.id,
+            ChatRefinementRequest(message=payload.instruction),
+            db,
+        )
+        return {"dashboard_id": record.id, "dashboard": refined["dashboard"]}
+    raise HTTPException(400, "Provide an instruction or dashboard schema.")
 
 
 @app.post("/generate_insights")
@@ -129,28 +727,44 @@ def generate_insights(payload: InsightsRequest, db: Session = Depends(get_db)):
 def query_dataset(
     dataset_id: int,
     metric: str,
+    table_id: str = "main",
     aggregation: str = "sum",
     group_by: str | None = None,
     sort: str = "desc",
-    filter_field: str | None = None,
-    filter_value: str | None = None,
+    filter_field: list[str] | None = Query(default=None),
+    filter_value: list[str] | None = Query(default=None),
     limit: int = Query(12, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     dataset = db.get(Dataset, dataset_id)
     if not dataset:
         raise HTTPException(404, "Dataset not found.")
-    valid_fields = {column["name"] for column in dataset.profile["column_profiles"]}
-    if metric not in valid_fields or (group_by and group_by not in valid_fields):
+    valid_fields = {
+        (column.get("table_id", "main"), column["name"])
+        for column in dataset.profile["column_profiles"]
+    }
+    if (table_id, metric) not in valid_fields or (
+        group_by and (table_id, group_by) not in valid_fields
+    ):
         raise HTTPException(400, "Query references an unknown field.")
-    if filter_field and filter_field not in valid_fields:
-        raise HTTPException(400, "Filter references an unknown field.")
+    fields = filter_field or []
+    values = filter_value or []
+    if len(fields) != len(values) or any((table_id, field) not in valid_fields for field in fields):
+        raise HTTPException(400, "Filters are invalid.")
     try:
         query = QuerySchema(
-            metric=metric, aggregation=aggregation, group_by=group_by, sort=sort, limit=limit
+            table_id=table_id,
+            metric=metric,
+            aggregation=aggregation,
+            group_by=group_by,
+            sort=sort,
+            limit=limit,
         )
-        filters = {filter_field: filter_value} if filter_field and filter_value else None
-        return execute_query(read_dataframe(dataset.file_path), query, filters)
+        filters = dict(zip(fields, values, strict=True))
+        tables = read_dataset_tables(dataset.file_path)
+        if table_id not in tables:
+            raise ValueError("Unknown table.")
+        return execute_query(tables[table_id], query, filters)
     except Exception as exc:
         raise HTTPException(400, f"Could not execute query: {exc}") from exc
 
@@ -159,13 +773,18 @@ def query_dataset(
 def filter_options(
     dataset_id: int,
     field: str,
+    table_id: str = "main",
     db: Session = Depends(get_db),
 ):
     dataset = db.get(Dataset, dataset_id)
     if not dataset:
         raise HTTPException(404, "Dataset not found.")
-    valid_fields = {column["name"] for column in dataset.profile["column_profiles"]}
-    if field not in valid_fields:
+    valid_fields = {
+        (column.get("table_id", "main"), column["name"])
+        for column in dataset.profile["column_profiles"]
+    }
+    if (table_id, field) not in valid_fields:
         raise HTTPException(400, "Unknown filter field.")
-    values = read_dataframe(dataset.file_path)[field].dropna().astype(str).value_counts().head(50).index
+    tables = read_dataset_tables(dataset.file_path)
+    values = tables[table_id][field].dropna().astype(str).value_counts().head(50).index
     return {"options": values.tolist()}
