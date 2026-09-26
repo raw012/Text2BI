@@ -6,7 +6,6 @@ import pandas as pd
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from fastapi.staticfiles import StaticFiles
 from sqlalchemy import MetaData, Table, create_engine as create_source_engine, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
@@ -29,6 +28,7 @@ from .schemas import (
     QuerySchema,
 )
 from .services.data_service import execute_query
+from .services.object_storage import persist_file, read_logo
 from .services.data_service import (
     discover_file_tables,
     profile_dataset_tables,
@@ -47,7 +47,7 @@ from .services.workflow_progress import (
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title=settings.app_name, version="0.2.0")
+app = FastAPI(title=settings.app_name, version="0.2.0", root_path=settings.api_root_path)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin, "http://127.0.0.1:5173"],
@@ -55,7 +55,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
+
+@app.get("/uploads/{name}")
+def uploaded_logo(name: str):
+    try:
+        content = read_logo(name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(404, "Logo not found") from None
+    suffix = Path(name).suffix.lower()
+    mime = {".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg", ".webp": "image/webp", ".ico": "image/x-icon"}
+    return Response(content, media_type=mime.get(suffix, "application/octet-stream"))
 
 
 def _latest_run(db: Session, dashboard_id: int) -> DashboardRun | None:
@@ -642,7 +652,9 @@ async def upload_logo(request: Request, file: UploadFile = File(...)):
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(413, "Logo exceeds 5 MB.")
     name = f"logo-{uuid4().hex}{suffix}"
-    (settings.upload_dir / name).write_bytes(content)
+    path = settings.upload_dir / name
+    path.write_bytes(content)
+    persist_file(path, prefix="logos")
     return {"logo_url": str(request.base_url).rstrip("/") + f"/uploads/{name}"}
 
 

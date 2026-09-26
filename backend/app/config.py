@@ -6,6 +6,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_name: str = "Text2BI API"
     database_url: str = "sqlite:///./text2bi.db"
+    db_host: str | None = None
+    db_name: str = "text2bi"
+    db_username: str = "text2bi"
+    db_password: str | None = None
     qwen_api_key: str | None = None
     qwen_model: str = "qwen-plus"
     qwen_vl_model: str = "qwen-vl-max"
@@ -15,6 +19,8 @@ class Settings(BaseSettings):
     max_upload_mb: int = 25
     max_workflow_iterations: int = 5
     upload_dir: Path = Path("uploads")
+    upload_bucket: str | None = None
+    api_root_path: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

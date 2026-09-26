@@ -159,6 +159,17 @@ Month, quarter, year, MoM, and YoY components are created only when the request
 explicitly asks for time analysis and the uploaded data supports it. They are
 not added as generic dashboard defaults.
 
+## Phase 1: AWS-ready deployment
+
+The backend supports private S3 upload storage when `UPLOAD_BUCKET` is set.
+Dataset manifests, source files, and logos are shared between container tasks
+through S3; local development still uses `backend/uploads`. `DB_HOST`,
+`DB_NAME`, `DB_USERNAME`, and a secret-injected `DB_PASSWORD` connect to RDS.
+The deployed frontend calls the backend through its `/api` proxy on one HTTPS
+origin. See [infra/README.md](infra/README.md) for the foundation/application
+stacks, deployment order, required inputs, and current limitations. AWS
+deployment and its live smoke tests remain pending a non-root deployment profile.
+
 ## One-command start
 
 Put the Qwen key in `backend/.env`, then run from the repository root:

@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from ..config import settings
 from ..schemas import BrandIdentitySpec
 from .llm_service import qwen_structured
+from .object_storage import persist_file
 
 
 KNOWN_DOMAINS = {
@@ -159,6 +160,7 @@ def resolve_brand_assets(request: str) -> tuple[str | None, dict | None, str | N
     }.get(content_type, ".img")
     target = settings.upload_dir / f"brand-{uuid4().hex}{extension}"
     target.write_bytes(content)
+    persist_file(target, prefix="logos")
     logo_url = f"{settings.backend_public_url.rstrip('/')}/uploads/{target.name}"
     source = "official_site" if downloaded else "custom_mark"
     return logo_url, identity.model_dump(mode="json"), source

@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from ..schemas import ColumnProfile, DatasetProfile, QuerySchema, TableProfile
+from .object_storage import is_s3_uri, materialize, persist_file
 
 
 def table_slug(value: str) -> str:
@@ -14,7 +15,7 @@ def table_slug(value: str) -> str:
 
 
 def read_dataframe(path: str | Path, sheet_name: str | None = None) -> pd.DataFrame:
-    path = Path(path)
+    path = materialize(path)
     if path.suffix.lower() == ".csv":
         return pd.read_csv(path, encoding="utf-8-sig")
     if path.suffix.lower() in {".xlsx", ".xls"}:
@@ -56,17 +57,21 @@ def discover_file_tables(
     return entries
 
 
-def write_dataset_manifest(entries: list[dict[str, Any]], path: str | Path) -> Path:
-    manifest_path = Path(path)
+def write_dataset_manifest(entries: list[dict[str, Any]], path: str | Path) -> str:
+    manifest_path = materialize(path) if is_s3_uri(path) else Path(path)
+    stored_entries = [dict(entry) for entry in entries]
+    for entry in stored_entries:
+        if not is_s3_uri(entry["path"]):
+            entry["path"] = persist_file(entry["path"])
     manifest_path.write_text(
-        json.dumps({"kind": "text2bi_dataset_bundle", "version": 1, "tables": entries}),
+        json.dumps({"kind": "text2bi_dataset_bundle", "version": 1, "tables": stored_entries}),
         encoding="utf-8",
     )
-    return manifest_path
+    return persist_file(manifest_path)
 
 
 def read_dataset_manifest(path: str | Path) -> list[dict[str, Any]]:
-    source = Path(path)
+    source = materialize(path)
     if source.suffix.lower() != ".json":
         return [
             {

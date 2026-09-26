@@ -1,6 +1,6 @@
 import type { ChartData, ChatMessage, Dashboard, DashboardSummary, Dataset, DatasetPreview, WorkflowRun } from "../types";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}${path}`, init);
