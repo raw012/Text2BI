@@ -60,6 +60,20 @@ class DatabaseImportRequest(BaseModel):
     row_limit: int = Field(default=100_000, ge=1, le=500_000)
 
 
+class LiveConnectionRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    database_url: str = Field(min_length=8, max_length=2000)
+    allowed_tables: list[str] = Field(min_length=1, max_length=12)
+
+
+class LiveQuestionRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+
+
+class SqlPlan(BaseModel):
+    sql: str
+
+
 class FieldRef(BaseModel):
     table_id: str = "main"
     name: str

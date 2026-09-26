@@ -14,12 +14,14 @@ from .agent_tools.dashboard import prepare_dashboard_for_display, render_dashboa
 from .agents.workflow import dashboard_workflow
 from .config import settings
 from .database import Base, SessionLocal, database_url, engine, get_db
-from .models import Dashboard, DashboardMessage, DashboardRun, Dataset, DatasetVersion
+from .models import Dashboard, DashboardMessage, DashboardRun, Dataset, DatasetVersion, LiveConnection
 from .schemas import (
     ChatRefinementRequest,
     ChatRefinementResponse,
     DashboardSchema,
     DatabaseImportRequest,
+    LiveConnectionRequest,
+    LiveQuestionRequest,
     DatasetResponse,
     GenerateDashboardRequest,
     GenerateDashboardResponse,
@@ -29,6 +31,10 @@ from .schemas import (
 )
 from .services.data_service import execute_query
 from .services.object_storage import persist_file, read_logo
+from .services.live_database import (
+    ask_live, delete_secret, load_secret, save_secret, source_schema,
+    validate_tables, validate_url,
+)
 from .services.data_service import (
     discover_file_tables,
     profile_dataset_tables,
@@ -287,6 +293,83 @@ def _run_chat_background(run_id: str, dashboard_id: int, message: str) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "mode": "qwen" if settings.qwen_api_key else "heuristic"}
+
+
+@app.get("/live_connections")
+def list_live_connections(db: Session = Depends(get_db)):
+    records = db.query(LiveConnection).order_by(LiveConnection.created_at.desc()).all()
+    return [{"id": item.id, "name": item.name, "allowed_tables": item.allowed_tables}
+            for item in records]
+
+
+@app.post("/live_connections", status_code=201)
+def create_live_connection(payload: LiveConnectionRequest, db: Session = Depends(get_db)):
+    if not settings.live_connection_secret_prefix:
+        raise HTTPException(503, "Live connection secret storage is not configured.")
+    try:
+        validate_url(payload.database_url)
+        tables = validate_tables(payload.allowed_tables)
+        source_schema(payload.database_url, tables, require_readonly=True)
+    except Exception as exc:
+        raise HTTPException(400, "Connection must use an accessible read-only PostgreSQL role and allowed tables.") from exc
+    arn = None
+    try:
+        arn = save_secret(payload.database_url)
+        record = LiveConnection(name=payload.name, secret_arn=arn, allowed_tables=tables)
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    except Exception:
+        db.rollback()
+        if arn:
+            try:
+                delete_secret(arn)
+            except Exception:
+                pass
+        raise HTTPException(502, "Could not save the connection securely.") from None
+    return {"id": record.id, "name": record.name, "allowed_tables": record.allowed_tables}
+
+
+@app.get("/live_connections/{connection_id}/schema")
+def live_connection_schema(connection_id: int, db: Session = Depends(get_db)):
+    record = db.get(LiveConnection, connection_id)
+    if not record:
+        raise HTTPException(404, "Live connection not found.")
+    try:
+        return {"tables": source_schema(load_secret(record.secret_arn), record.allowed_tables)}
+    except Exception:
+        raise HTTPException(502, "Could not inspect the live database.") from None
+
+
+@app.post("/live_connections/{connection_id}/ask")
+def ask_live_connection(
+    connection_id: int,
+    payload: LiveQuestionRequest,
+    db: Session = Depends(get_db),
+):
+    record = db.get(LiveConnection, connection_id)
+    if not record:
+        raise HTTPException(404, "Live connection not found.")
+    try:
+        return ask_live(record.secret_arn, record.allowed_tables, payload.question)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception:
+        raise HTTPException(502, "The governed query could not be completed.") from None
+
+
+@app.delete("/live_connections/{connection_id}", status_code=204)
+def remove_live_connection(connection_id: int, db: Session = Depends(get_db)):
+    record = db.get(LiveConnection, connection_id)
+    if not record:
+        raise HTTPException(404, "Live connection not found.")
+    try:
+        delete_secret(record.secret_arn)
+    except Exception:
+        raise HTTPException(502, "Could not schedule credential deletion.") from None
+    db.delete(record)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.get("/datasets", response_model=list[DatasetResponse])

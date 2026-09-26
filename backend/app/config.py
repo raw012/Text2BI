@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     upload_dir: Path = Path("uploads")
     upload_bucket: str | None = None
     api_root_path: str = ""
+    live_connection_secret_prefix: str | None = None
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

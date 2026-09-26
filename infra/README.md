@@ -27,6 +27,17 @@ objects in the upload bucket. Database and bucket retention settings preserve
 data if the stack is removed. Review costs before deployment: RDS, ALB, Fargate,
 CloudWatch, S3, and data transfer incur charges.
 
+For live database questions, create a dedicated PostgreSQL login with SELECT
+access to the curated tables and no write grants. Connect it from **Ask your
+data → Live database**. The backend checks the role and stores its URL only in
+Secrets Manager under `text2bi/connectors/`. It stores just the ARN and table
+allowlist in PostgreSQL. The ECS task role has scoped create/read/delete secret
+permissions for that prefix. A question re-inspects the live schema, accepts
+only a single SELECT over allowlisted tables, and executes within a read-only
+transaction with a five-second timeout and 100-row response cap. Limit
+application access to trusted users until authentication and tenant isolation
+are implemented.
+
 For a limited deployment profile, allow CloudFormation stack create/update/read,
 the resource actions needed by these templates (S3, ECR, RDS, EC2 networking,
 ELBv2, ECS, IAM role/policy creation with `iam:PassRole`, CloudWatch Logs, and

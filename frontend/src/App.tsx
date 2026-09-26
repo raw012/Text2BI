@@ -24,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import { ChartCard } from "./components/ChartCard";
+import { LiveDatabaseAssistant } from "./components/LiveDatabaseAssistant";
 import { api } from "./lib/api";
 import type { ChatMessage, Dashboard, DashboardSummary, Dataset, DatasetPreview, WorkflowRun } from "./types";
 
@@ -661,7 +662,7 @@ function App() {
         {view === "home" && <WorkspaceHome datasets={datasets} dashboards={dashboards} loading={loadingLibrary} onOpenDashboard={openDashboard} onView={setView} onCreate={openStudio} />}
         {view === "dashboards" && <DashboardLibrary dashboards={dashboards} onOpen={openDashboard} onCreate={openStudio} />}
         {view === "data" && <DataLibrary datasets={datasets} onRefresh={refreshLibrary} onCreate={openStudio} />}
-        {view === "assistant" && <DataAssistant datasets={datasets} onCreate={openStudio} />}
+        {view === "assistant" && <AssistantWorkspace datasets={datasets} onCreate={openStudio} />}
         {view === "studio" && <AnalysisStudio key={studioKey} />}
       </main>
       <ErrorToast error={workspaceError} onClose={() => setWorkspaceError("")} />
@@ -744,6 +745,11 @@ function DataLibrary({ datasets, onRefresh, onCreate }: { datasets: Dataset[]; o
     <div className="data-workspace"><aside><div className="data-list-heading"><strong>All sources</strong><span>{datasets.length}</span></div>{datasets.map((item) => <SourceRow key={item.id} dataset={item} selected={item.id === selected?.id} onClick={() => setSelectedId(item.id)} />)}{!datasets.length && <EmptyState text="No data sources yet." action="Upload data" onAction={() => uploadInput.current?.click()} />}</aside>
       <section className="data-detail">{selected ? <><header><div><span className="source-icon large"><Database size={21} /></span><div><h2>{selected.name}</h2><p>{selected.row_count.toLocaleString()} rows · {selected.column_count} fields</p></div></div><div><button className="secondary-button" onClick={() => replaceInput.current?.click()} disabled={busy}><RefreshCw size={14} /> Replace data</button><button className="dark-button" onClick={onCreate}><Sparkles size={14} /> Build dashboard</button><input ref={replaceInput} hidden multiple type="file" accept=".csv,.xlsx,.xls" onChange={(event) => void replaceFiles(Array.from(event.target.files || []))} /></div></header><div className="data-tabs"><button className="active">Data preview</button><button>Schema</button><button>Version history</button><button>Connections</button></div>{preview ? <div className="preview-table-wrap"><table><thead><tr>{preview.columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{preview.rows.map((row, index) => <tr key={index}>{preview.columns.map((column) => <td key={column}>{String(row[column] ?? "—")}</td>)}</tr>)}</tbody></table><footer>Showing {preview.rows.length} of {preview.total_rows.toLocaleString()} rows</footer></div> : <EmptyState text="Select a data source to preview its rows." />}</> : <EmptyState text="Upload a CSV or Excel file to create your first reusable data source." action="Upload data" onAction={() => uploadInput.current?.click()} />}</section>
     </div></div>;
+}
+
+function AssistantWorkspace({ datasets, onCreate }: { datasets: Dataset[]; onCreate: () => void }) {
+  const [mode, setMode] = useState<"saved" | "live">("saved");
+  return <><div className="data-mode-tabs"><button className={mode === "saved" ? "active" : ""} onClick={() => setMode("saved")}>Saved sources</button><button className={mode === "live" ? "active" : ""} onClick={() => setMode("live")}>Live database</button></div>{mode === "saved" ? <DataAssistant datasets={datasets} onCreate={onCreate} /> : <LiveDatabaseAssistant />}</>;
 }
 
 function DataAssistant({ datasets, onCreate }: { datasets: Dataset[]; onCreate: () => void }) {

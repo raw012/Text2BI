@@ -1,5 +1,8 @@
 import type { ChartData, ChatMessage, Dashboard, DashboardSummary, Dataset, DatasetPreview, WorkflowRun } from "../types";
 
+export type LiveConnection = { id: number; name: string; allowed_tables: string[] };
+export type LiveAnswer = { answer: string; sql: string; row_count: number; rows: Record<string, unknown>[]; schema: unknown[] };
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -8,10 +11,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await response.json().catch(() => ({ detail: "Something went wrong." }));
     throw new Error(body.detail || "Request failed.");
   }
+  if (response.status === 204) return undefined as T;
   return response.json();
 }
 
 export const api = {
+  liveConnections() {
+    return request<LiveConnection[]>("/live_connections");
+  },
+  createLiveConnection(payload: { name: string; database_url: string; allowed_tables: string[] }) {
+    return request<LiveConnection>("/live_connections", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+  },
+  askLive(connectionId: number, question: string) {
+    return request<LiveAnswer>(`/live_connections/${connectionId}/ask`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question }),
+    });
+  },
+  deleteLiveConnection(connectionId: number) {
+    return request<void>(`/live_connections/${connectionId}`, { method: "DELETE" });
+  },
   datasets() {
     return request<Dataset[]>("/datasets");
   },

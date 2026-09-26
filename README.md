@@ -181,6 +181,20 @@ tables contain hundreds of rows. Use
 server-side PostgreSQL credentials, without reading the raw year into Pandas.
 Live NYC TLC, PostgreSQL, and Glue validation is still pending.
 
+## Phase 3: live database assistant
+
+**Ask your data → Live database** saves a PostgreSQL connection in AWS Secrets
+Manager when `LIVE_CONNECTION_SECRET_PREFIX` is configured. PostgreSQL stores
+only its secret ARN and an allowlist of schema-qualified tables. The selected
+database role must have SELECT and no write privileges on those tables. Each
+question re-reads column metadata, generates SQL through Qwen, checks that it
+is a single SELECT against the allowlist, and runs it in a read-only transaction
+with a five-second timeout. Answers include the executed SQL, returned row
+count, and rows. Deleting a connection schedules credential deletion in
+Secrets Manager. See [infra/README.md](infra/README.md) for deployment and
+security requirements. Without Secrets Manager configured, creation returns
+503; no credentials are persisted locally.
+
 ## One-command start
 
 Put the Qwen key in `backend/.env`, then run from the repository root:
@@ -290,6 +304,11 @@ generated mark is an official logo.
 | `GET` | `/datasets/{id}/versions` | List archived dataset versions |
 | `POST` | `/upload_dataset` | Profile multiple CSV/XLS/XLSX files and sheets |
 | `POST` | `/connect_database` | Import a PostgreSQL, MySQL/MariaDB, or SQLite table snapshot without storing credentials |
+| `POST` | `/datasets/connect_curated_tlc` | Import a Spark-curated TLC serving table using server-side PostgreSQL credentials |
+| `GET`/`POST` | `/live_connections` | List or save live PostgreSQL connections (credentials in Secrets Manager) |
+| `GET` | `/live_connections/{id}/schema` | Inspect current allowlisted table metadata |
+| `POST` | `/live_connections/{id}/ask` | Generate and execute governed SQL with cited rows |
+| `DELETE` | `/live_connections/{id}` | Disconnect and schedule secret deletion |
 | `POST` | `/upload_logo` | Store an optional dashboard logo |
 | `POST` | `/generate_dashboard` | Run the iterative multi-agent workflow |
 | `POST` | `/workflow_runs/generate` | Start generation without blocking the browser |
@@ -311,11 +330,11 @@ for the current native-development configuration.
 ## Current connector roadmap
 
 CSV, Excel, and one-time PostgreSQL, MySQL/MariaDB, and SQLite table snapshots
-are implemented. Database credentials are used only for the import request and
-are not persisted. The Data Sources workspace and versioned dataset contract
-are the base for scheduled Google Sheets, Snowflake, and Databricks connectors.
-Production connector work still requires encrypted credential storage,
-tenant-level permissions, refresh jobs, lineage, and schema drift mapping.
+are implemented. Snapshot credentials are used only for the import request.
+The live PostgreSQL assistant stores credentials in Secrets Manager when
+configured and reads the current schema for every question. Production
+connector work still requires authentication, tenant-level permissions,
+refresh jobs, lineage, and schema drift mapping.
 
 ## Validation
 

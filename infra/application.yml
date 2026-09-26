@@ -29,6 +29,10 @@ Parameters:
   PublicOrigin:
     Type: String
     AllowedPattern: '^https://[^/]+$'
+  LiveSecretPrefix:
+    Type: String
+    Default: text2bi/connectors
+    AllowedPattern: '^[a-zA-Z0-9/_-]+$'
 Resources:
   LoadBalancerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -132,6 +136,13 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:PutObject]
                 Resource: !Sub 'arn:${AWS::Partition}:s3:::${UploadBucket}/*'
+        - PolicyName: live-connection-secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:CreateSecret, secretsmanager:GetSecretValue, secretsmanager:DeleteSecret]
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LiveSecretPrefix}/*'
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -156,6 +167,7 @@ Resources:
             - {Name: FRONTEND_ORIGIN, Value: !Ref PublicOrigin}
             - {Name: BACKEND_PUBLIC_URL, Value: !Sub '${PublicOrigin}/api'}
             - {Name: API_ROOT_PATH, Value: /api}
+            - {Name: LIVE_CONNECTION_SECRET_PREFIX, Value: !Ref LiveSecretPrefix}
           Secrets:
             - Name: DB_PASSWORD
               ValueFrom: !Sub '${DbSecretArn}:password::'
