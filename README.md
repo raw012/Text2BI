@@ -170,6 +170,17 @@ origin. See [infra/README.md](infra/README.md) for the foundation/application
 stacks, deployment order, required inputs, and current limitations. AWS
 deployment and its live smoke tests remain pending a non-root deployment profile.
 
+## Phase 2: distributed TLC pipeline
+
+The [Spark pipeline](spark/README.md) profiles yellow-taxi Parquet with
+distributed null/stat aggregates, creates daily and pickup-zone serving
+tables, and replaces one year atomically in PostgreSQL. The same script is
+configured for a two-worker Glue 5.1 job in `infra/spark.yml`. The curated
+tables contain hundreds of rows. Use
+`POST /datasets/connect_curated_tlc?table=tlc_daily` to register them using
+server-side PostgreSQL credentials, without reading the raw year into Pandas.
+Live NYC TLC, PostgreSQL, and Glue validation is still pending.
+
 ## One-command start
 
 Put the Qwen key in `backend/.env`, then run from the repository root:

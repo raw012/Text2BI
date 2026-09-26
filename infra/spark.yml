@@ -1,0 +1,112 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Two-worker Glue Spark job for yearly NYC TLC aggregates in private RDS PostgreSQL.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  GlueSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  DbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  DbHost:
+    Type: String
+  DbSecretArn:
+    Type: String
+  DataBucket:
+    Type: String
+  ScriptKey:
+    Type: String
+    Default: spark/tlc_pipeline.py
+  RawInput:
+    Type: String
+    Description: S3 URI glob such as s3://bucket/tlc-raw/yellow_tripdata_2024-*.parquet
+  ServiceYear:
+    Type: String
+    Default: '2024'
+    AllowedPattern: '20[0-9][0-9]'
+Resources:
+  GlueSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Glue workers need internal traffic for Spark shuffle and a route to RDS.
+        must: [No public ingress, Use a subnet with S3 and Secrets Manager access]
+    Properties:
+      GroupDescription: Text2BI Glue Spark workers
+      VpcId: !Ref VpcId
+  WorkerIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GlueSecurityGroup.GroupId
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !GetAtt GlueSecurityGroup.GroupId
+  DbIngressFromGlue:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt GlueSecurityGroup.GroupId
+  NetworkConnection:
+    Type: AWS::Glue::Connection
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      ConnectionInput:
+        Name: !Sub '${AWS::StackName}-network'
+        ConnectionType: NETWORK
+        PhysicalConnectionRequirements:
+          SubnetId: !Ref GlueSubnetId
+          SecurityGroupIdList: [!GetAtt GlueSecurityGroup.GroupId]
+  GlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: glue.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: tlc-data-and-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${DataBucket}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecretArn
+  TlcJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Role: !GetAtt GlueRole.Arn
+      GlueVersion: '5.1'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${DataBucket}/${ScriptKey}'
+      Connections:
+        Connections: [!Ref NetworkConnection]
+      DefaultArguments:
+        '--job-language': python
+        '--enable-job-insights': 'true'
+        '--additional-python-modules': 'psycopg[binary]==3.2.3'
+        '--input': !Ref RawInput
+        '--year': !Ref ServiceYear
+        '--database-secret-arn': !Ref DbSecretArn
+        '--db-host': !Ref DbHost
+Outputs:
+  JobName:
+    Value: !Ref TlcJob

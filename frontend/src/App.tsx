@@ -43,7 +43,8 @@ function AnalysisStudio() {
   const logoInput = useRef<HTMLInputElement>(null);
   const [dataset, setDataset] = useState<Dataset | null>(null);
   const [availableDatasets, setAvailableDatasets] = useState<Dataset[]>([]);
-  const [dataMode, setDataMode] = useState<"existing" | "upload" | "database">("existing");
+  const [dataMode, setDataMode] = useState<"existing" | "upload" | "database" | "curated">("existing");
+  const [curatedTable, setCuratedTable] = useState<"tlc_daily" | "tlc_pickup_zone">("tlc_daily");
   const [databaseUrl, setDatabaseUrl] = useState("");
   const [databaseTable, setDatabaseTable] = useState("");
   const [databaseName, setDatabaseName] = useState("");
@@ -135,6 +136,20 @@ function AnalysisStudio() {
       setAvailableDatasets(await api.datasets());
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Database import failed.");
+    } finally {
+      setLoading(null);
+    }
+  }
+
+  async function importCuratedTlc() {
+    setLoading("connect");
+    setError("");
+    try {
+      const imported = await api.connectCuratedTlc(curatedTable);
+      setDataset(imported);
+      setAvailableDatasets(await api.datasets());
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Curated TLC import failed.");
     } finally {
       setLoading(null);
     }
@@ -240,6 +255,7 @@ function AnalysisStudio() {
                 <button className={dataMode === "existing" ? "active" : ""} onClick={() => setDataMode("existing")}><Database size={14} /> Existing</button>
                 <button className={dataMode === "upload" ? "active" : ""} onClick={() => setDataMode("upload")}><UploadCloud size={14} /> Upload</button>
                 <button className={dataMode === "database" ? "active" : ""} onClick={() => setDataMode("database")}><Table2 size={14} /> Database</button>
+                <button className={dataMode === "curated" ? "active" : ""} onClick={() => setDataMode("curated")}><Table2 size={14} /> Curated TLC</button>
               </div>
               {dataMode === "existing" && (
                 <div className="existing-source-picker">
@@ -261,6 +277,11 @@ function AnalysisStudio() {
                 <div><label><span>Table</span><input value={databaseTable} onChange={(event) => setDatabaseTable(event.target.value)} placeholder="employees" /></label><label><span>Display name</span><input value={databaseName} onChange={(event) => setDatabaseName(event.target.value)} placeholder="HR warehouse" /></label></div>
                 <button onClick={() => void importDatabase()} disabled={!databaseUrl.trim() || !databaseTable.trim() || loading !== null}>{loading === "connect" ? <LoaderCircle className="spin" size={15} /> : <Database size={15} />} Import table snapshot</button>
                 <small>Credentials are used for this import and are not stored by Text2BI.</small>
+              </div>}
+              {dataMode === "curated" && <div className="database-connect-form">
+                <label><span>Serving table</span><select value={curatedTable} onChange={(event) => setCuratedTable(event.target.value as "tlc_daily" | "tlc_pickup_zone")}><option value="tlc_daily">Daily trips</option><option value="tlc_pickup_zone">Pickup zones</option></select></label>
+                <button onClick={() => void importCuratedTlc()} disabled={loading !== null}>{loading === "connect" ? <LoaderCircle className="spin" size={15} /> : <Database size={15} />} Use curated table</button>
+                <small>Uses the application PostgreSQL connection. Run the Spark pipeline first.</small>
               </div>}
               <input
                 ref={fileInput}

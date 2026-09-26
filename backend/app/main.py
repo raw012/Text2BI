@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .agent_tools.dashboard import prepare_dashboard_for_display, render_dashboard
 from .agents.workflow import dashboard_workflow
 from .config import settings
-from .database import Base, SessionLocal, engine, get_db
+from .database import Base, SessionLocal, database_url, engine, get_db
 from .models import Dashboard, DashboardMessage, DashboardRun, Dataset, DatasetVersion
 from .schemas import (
     ChatRefinementRequest,
@@ -567,6 +567,29 @@ def connect_database(payload: DatabaseImportRequest, db: Session = Depends(get_d
     db.commit()
     db.refresh(dataset)
     return dataset
+
+
+@app.post("/datasets/connect_curated_tlc", response_model=DatasetResponse)
+def connect_curated_tlc(
+    table: str = Query(default="tlc_daily", pattern="^(tlc_daily|tlc_pickup_zone)$"),
+    db: Session = Depends(get_db),
+):
+    """Register a small Spark-curated serving table using server-side credentials."""
+    url = (
+        database_url.render_as_string(hide_password=False)
+        if hasattr(database_url, "render_as_string") else str(database_url)
+    )
+    if not url.startswith("postgresql"):
+        raise HTTPException(409, "The curated TLC connector requires PostgreSQL.")
+    return connect_database(
+        DatabaseImportRequest(
+            database_url=url,
+            schema_name="curated",
+            table_name=table,
+            dataset_name=f"NYC TLC · {table}",
+        ),
+        db,
+    )
 
 
 @app.post("/datasets/{dataset_id}/replace", response_model=DatasetResponse)

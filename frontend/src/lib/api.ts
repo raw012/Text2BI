@@ -38,6 +38,9 @@ export const api = {
       body: JSON.stringify(payload),
     });
   },
+  connectCuratedTlc(table: "tlc_daily" | "tlc_pickup_zone") {
+    return request<Dataset>(`/datasets/connect_curated_tlc?table=${table}`, { method: "POST" });
+  },
   upload(files: File[]) {
     const body = new FormData();
     files.forEach((file) => body.append("files", file));
