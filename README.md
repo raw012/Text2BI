@@ -42,33 +42,137 @@ preserved rather than deleted.
 
 ## Architecture
 
+Read the system in four views: **workspace → data → AI workflow → deployment**.
+Each diagram answers one question; implementation contracts stay in the sections
+below.
+
+### 1. System overview — what connects to what?
+
 ```mermaid
-flowchart TD
-  S[CSV / Excel / future connector] --> V[Versioned data source]
-  V --> U[Dataset + request]
-  V --> Q[Ask your data]
-  U --> D[Data Analyst]
-  D -->|DataAnalysisSpec| B[Business Analyst]
-  B -->|KPIFormulaSpec| K[Deterministic KPI calculator]
-  K -->|KPIResultSet| I[BI Designer]
-  I -->|DashboardSchema| R[Preview renderer]
-  R -->|HTML + computed chart data| E[BI Evaluation]
-  E -->|Passed| P[Publish result]
-  E -->|Visual or usability issue| I
-  E -->|Business requirement issue| B
-  E -->|Data issue| D
-  P --> F[React + ECharts]
-  P --> H[Downloadable HTML]
-  F --> C[Dashboard Copilot]
-  C --> D
-  C --> B
-  C --> I
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial, sans-serif","fontSize":"15px","lineColor":"#64748b","edgeLabelBackground":"#ffffff"},"flowchart":{"htmlLabels":false,"curve":"linear","padding":16,"nodeSpacing":30,"rankSpacing":35}}}%%
+flowchart LR
+  SOURCES("Data sources<br/>Files · database snapshots · curated tables")
+  API("Text2BI backend<br/>FastAPI · data access · AI workflow")
+  UI("Analytics workspace<br/>React · ECharts · Dashboard Copilot")
+  STORE[("Persistent storage<br/>Datasets · dashboards · revisions")]
+  SOURCES --> API
+  UI <-->|Requests and results| API
+  API <--> STORE
+  UI --> HTML("Export<br/>Interactive HTML report")
+
+  classDef data fill:#ecfdf5,stroke:#0f766e,color:#134e4a;
+  classDef app fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
+  class SOURCES,STORE data;
+  class API,UI,HTML app;
 ```
+
+The backend serves both dashboard generation and **Ask your data**. Database
+snapshots become saved data sources; the governed live PostgreSQL assistant
+queries allowlisted tables on demand. Local storage uses SQLite or PostgreSQL
+and upload files; the AWS templates use RDS PostgreSQL and S3.
+
+### 2. Data processing — how does raw data become BI input?
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial, sans-serif","fontSize":"15px","lineColor":"#64748b","edgeLabelBackground":"#ffffff"},"flowchart":{"htmlLabels":false,"curve":"linear","padding":16,"nodeSpacing":30,"rankSpacing":35}}}%%
+flowchart LR
+  FILES("CSV / Excel / database snapshot") --> PROFILE("Import and profile<br/>Validate schema · version the source")
+  PROFILE --> LIBRARY("Data Sources library<br/>Reusable dashboard input")
+
+  RAW("TLC Parquet<br/>Local files or S3") --> SPARK("Spark batch job<br/>Profile · filter · aggregate")
+  SPARK --> TABLES[("PostgreSQL curated tables<br/>Daily and pickup-zone summaries")]
+  TABLES -->|Register a snapshot| LIBRARY
+
+  classDef data fill:#ecfdf5,stroke:#0f766e,color:#134e4a;
+  classDef process fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
+  class FILES,RAW,TABLES,LIBRARY data;
+  class PROFILE,SPARK process;
+```
+
+Spark runs separately from web requests. It prepares small serving tables so
+the dashboard workflow does not load the raw taxi dataset into Pandas. The TLC
+pipeline is a dedicated batch path; normal uploads do not automatically launch
+Spark. Register curated results through
+`POST /datasets/connect_curated_tlc?table=tlc_daily`.
+
+**Verified locally:** three synthetic-data tests cover the real Parquet-to-CLI
+path, profiling, aggregation, filtering, and missing-field rejection using
+`local[2]`. This uses two local execution threads. Real TLC data, PostgreSQL
+publishing, and multi-worker Glue execution still need validation.
+See the [local Spark walkthrough](spark/LOCAL_SMOKE_TEST.md) and
+[pipeline guide](spark/README.md).
+
+### 3. AI workflow — how is a report generated and improved?
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial, sans-serif","fontSize":"15px","lineColor":"#64748b","edgeLabelBackground":"#ffffff"},"flowchart":{"htmlLabels":false,"curve":"linear","padding":16,"nodeSpacing":30,"rankSpacing":35}}}%%
+flowchart LR
+  REQUEST("Dataset + business request") --> PLAN("Understand and plan<br/>Data Analyst · Business Analyst")
+  PLAN --> CALC("Calculate KPIs<br/>Deterministic Python tools")
+  CALC --> DESIGN("Design and render<br/>Dashboard schema · chart data")
+  DESIGN --> REVIEW{"Evaluate report"}
+  REVIEW -->|Accepted| SAVE("Save dashboard revision")
+  REVIEW -.->|Targeted correction| PLAN
+  SAVE -.->|User asks Dashboard Copilot| PLAN
+
+  classDef stage fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
+  classDef review fill:#f5f3ff,stroke:#7c3aed,color:#4c1d95;
+  classDef result fill:#ecfdf5,stroke:#0f766e,color:#134e4a;
+  class REQUEST,PLAN,CALC,DESIGN stage;
+  class REVIEW review;
+  class SAVE result;
+```
+
+The dotted arrows summarize refinement: the workflow routes each issue or user
+request to the affected Data Analyst, Business Analyst, or BI Designer stage.
+It does not necessarily rerun every stage shown above. Detailed typed contracts
+are listed below.
 
 Evaluation runs for at most five automatic iterations. If the fifth iteration
 still has blocking issues, Text2BI publishes the best available result with
 `needs_user_review`. The user can download it and start a new targeted revision
 through the chat panel.
+
+### 4. AWS deployment — where does the application run?
+
+**Template architecture; cloud deployment and live smoke tests are pending.**
+
+```mermaid
+%%{init: {"theme":"base","themeVariables":{"fontFamily":"Arial, sans-serif","fontSize":"15px","lineColor":"#64748b","edgeLabelBackground":"#ffffff"},"flowchart":{"htmlLabels":false,"curve":"linear","padding":16,"nodeSpacing":30,"rankSpacing":35}}}%%
+flowchart LR
+  USER("Browser") -->|HTTPS| ALB("Application Load Balancer")
+  subgraph TASK["ECS Fargate · one task"]
+    WEB("Frontend container<br/>Nginx · React")
+    BACKEND("Backend container<br/>FastAPI · AI workflow")
+    WEB -->|/api proxy| BACKEND
+  end
+  ALB --> WEB
+  BACKEND --> RDS[("RDS PostgreSQL<br/>Application records · curated tables")]
+  BACKEND --> S3[("S3<br/>Uploads · dataset files · logos")]
+
+  classDef app fill:#eff6ff,stroke:#2563eb,color:#1e3a8a;
+  classDef data fill:#ecfdf5,stroke:#0f766e,color:#134e4a;
+  class USER,ALB,WEB,BACKEND app;
+  class RDS,S3 data;
+  style TASK fill:#f8fafc,stroke:#94a3b8,color:#334155
+```
+
+Deployment is currently a manual sequence:
+
+1. Prepare the VPC/subnets, HTTPS certificate, and deployment credentials.
+2. Deploy [foundation.yml](infra/foundation.yml) to create S3, ECR image
+   repositories, and RDS; prepare the Qwen secret in Secrets Manager.
+3. Build the frontend/backend Docker images and push commit-tagged images to ECR.
+4. Deploy [application.yml](infra/application.yml) with those image URIs,
+   configure DNS, and verify the API and upload → dashboard → HTML flow.
+5. For the batch pipeline, upload Parquet and the Spark script to S3, configure
+   network access, then deploy [spark.yml](infra/spark.yml) and run Glue manually.
+
+Secrets Manager supplies credentials and CloudWatch collects application logs.
+The Glue job is separate from the Fargate application. Automated scheduling
+and CI/CD are later steps; creating or pushing a Git commit does not deploy
+these stacks. See the [deployment guide](infra/README.md) for inputs,
+network prerequisites and limitations.
 
 ## Agent skills
 
@@ -179,7 +283,8 @@ configured for a two-worker Glue 5.1 job in `infra/spark.yml`. The curated
 tables contain hundreds of rows. Use
 `POST /datasets/connect_curated_tlc?table=tlc_daily` to register them using
 server-side PostgreSQL credentials, without reading the raw year into Pandas.
-Live NYC TLC, PostgreSQL, and Glue validation is still pending.
+The [local Spark smoke tests](spark/LOCAL_SMOKE_TEST.md) pass on synthetic
+Parquet input. Live NYC TLC, PostgreSQL, and Glue validation is still pending.
 
 ## Phase 3: live database assistant
 
